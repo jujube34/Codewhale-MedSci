@@ -1,16 +1,16 @@
 !include "LogicLib.nsh"
+!define MEDSCI_GIT_INIT_SCRIPT "${__FILEDIR__}/windows-git-init.cmd"
 !macro NSIS_HOOK_POSTINSTALL
- ; PortableGit requires its own post-install script after extraction.
- ${If} ${FileExists} "$INSTDIR\resources\git-bash\post-install.bat"
-   SetOutPath "$INSTDIR\resources\git-bash"
-   DetailPrint "正在初始化内置 Git Bash..."
-   ExecWait '$\"$INSTDIR\resources\git-bash\git-bash.exe$\" --no-needs-console --hide --no-cd --command=post-install.bat' $0
-   ${If} $0 != 0
-     MessageBox MB_ICONSTOP "内置 Git Bash 初始化失败。返回码：$0" /SD IDOK
-     SetErrorLevel 2
-     Abort
-   ${EndIf}
-   SetOutPath "$INSTDIR"
+ ; Use an absolute command, scoped environment, and verified completion.
+ InitPluginsDir
+ File /oname=$PLUGINSDIR\medsci-git-init.cmd "${MEDSCI_GIT_INIT_SCRIPT}"
+ DetailPrint "正在初始化内置 Git Bash..."
+ nsExec::ExecToLog /TIMEOUT=60000 '$\"$SYSDIR\cmd.exe$\" /D /S /C $\"$\"$PLUGINSDIR\medsci-git-init.cmd$\" $\"$INSTDIR\resources\git-bash$\"$\"'
+ Pop $0
+ ${If} $0 != 0
+   MessageBox MB_ICONSTOP "内置 Git Bash 初始化或自检失败。请查看安装详细日志。返回码：$0" /SD IDOK
+   SetErrorLevel 2
+   Abort
  ${EndIf}
  SetShellVarContext current
  WriteRegStr HKCU "Software\Classes\Directory\shell\CodewhaleMedSci" "Icon" '$\"$INSTDIR\medsci-desktop.exe$\",0'

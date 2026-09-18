@@ -1,0 +1,15 @@
+python3 desktop/tests/windows-git-init.py:
+PASS: self-delete-exit-1
+PASS: self-delete-exit-0
+PASS: batch-remains
+PASS: post-step-fails
+PASS: bash-fails
+PASS: already-initialized
+PASS: missing-bash
+PASS: missing-git
+8 checks passed; 0 failed. Production NSIS and cmd; simulated Git/MSYS binaries.
+
+Regression replay against windows-hooks.nsh from bdc3bdf15:
+python3 desktop/tests/windows-git-init.py desktop/artifacts/git-init-test/legacy-hooks.nsh
+AssertionError: (self-delete-exit-1, actual installer exit 2, expected 0)
+The original hook rejects successful batch self-deletion with exit code 1.

@@ -32,7 +32,7 @@ source_hashes={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for nam
 provenance['source_manifest_sha256']=hashlib.sha256((resources/'source-manifest.json').read_bytes()).hexdigest()
 provenance['desktop_sha256']=hashlib.sha256(exe.read_bytes()).hexdigest()
 (resources/'build-provenance.json').write_text(json.dumps(provenance,indent=2)+'\n')
-output=artifacts/'Codewhale-MedSci_0.1.0-preview.7.4_windows-x64_internal-setup.exe'
+output=artifacts/'Codewhale-MedSci_0.1.0-preview.7.5_windows-x64_internal-setup.exe'
 def q(path):return str(path).replace('$','$$').replace('"','$\\"')
 # Uninstall only the files this installer owns, leaving any user-created files.
 deletes=[];dirs=[]
@@ -74,7 +74,7 @@ Section "Install"
   CreateShortcut "$SMPROGRAMS\\Codewhale-MedSci.lnk" "$INSTDIR\\medsci-desktop.exe"
   !insertmacro NSIS_HOOK_POSTINSTALL
   WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\CodewhaleMedSci" "DisplayName" "Codewhale-MedSci Internal Preview"
-  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\CodewhaleMedSci" "DisplayVersion" "0.1.0-preview.7.4"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\CodewhaleMedSci" "DisplayVersion" "0.1.0-preview.7.5"
   WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\CodewhaleMedSci" "UninstallString" '$\\"$INSTDIR\\Uninstall.exe$\\"'
   WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\CodewhaleMedSci" "NoModify" 1
   WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\CodewhaleMedSci" "NoRepair" 1

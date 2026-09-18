@@ -89,3 +89,9 @@ Windows Python 下重复执行编码检查：5 checks passed; 0 failed。禁用 
 使用官方 PortableGit 2.55.0.windows.5，验证 GitHub release asset SHA-256，保留全部 9584 个原始文件与许可证。复用 ShellDispatcher 的 SHELL=Bash 检测及原生 bash 工具；usr/bin 在应用 PATH 首位，直接执行 usr/bin/bash.exe 避免 bin/bash.exe 包装进程；原生环境提示会显示 bash，无新增执行循环。启动探测限时 30 秒，kill_on_drop 清理直接启动的 Bash。安装时按 PortableGit README 运行官方 post-install 脚本。
 
 当前 macOS Wine 上 Git Bash 在 FAST_CWD 警告后挂起：bin 包装器和直接 usr/bin/bash.exe --version 两条路径均未完成，测试进程已清理。不能以编译或包校验代替 Windows 命令执行、中文目录、停止续接和官方 post-install 的实机验证；以上功能需原生 Windows 验收。
+
+## Windows installer preview.7.5: Git initialization
+
+依据 2026-09-18 公司 Windows 10 诊断报告修复初始化成功后返回 1 被 NSIS 当作失败的问题。当前源码已有 SetOutPath；尚不能将报告中的错误 cwd 链路归因于缺失该行。新 hook 通过系统 cmd 调用绝对路径 helper，在 helper 内检查切换目录，优先使用包内 Git，仅改变子进程环境。官方批处理无论成功与否都可能自删，因此还检查 post-install 目录已清理，并执行包内 Bash、mtab 和 Git 自检；不直接放行所有返回码 1。
+
+生产 NSIS 宏 + 真实 Wine cmd + 可控 Git/MSYS 可执行替身覆盖 8 个场景。相同回归测试对 HEAD 中旧 hook 的首个场景失败：self-delete-exit-1，实际安装退出码 2，期望 0；修复版结果见 receipts/windows-git-init-preview7.5.txt。替身测试不证明真实 MSYS 初始化；此前本机 Wine 的 FAST_CWD 挂起限制未解决。中文路径下原生 Windows 10 安装、Bash/Git 启动与卸载仍须实机复验。

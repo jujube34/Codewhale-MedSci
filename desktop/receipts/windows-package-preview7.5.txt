@@ -1,0 +1,9 @@
+Windows installer preview.7.5, 2026-09-18.
+Application and Agent binaries reused from preview.7.4; no rebuild or provider calls.
+python3 desktop/scripts/package-windows.py — completed.
+python3 desktop/scripts/verify-windows-package.py:
+PASS: NSIS integrity, SHA-256, 12458 extracted payload files match staging, x64 PE binaries, VC runtime DLLs, source provenance, and all offline wheel hashes
+Native Windows install/uninstall, WebView2 and GUI behavior remain unverified on this macOS host.
+Embedded medsci-git-init.cmd hash matches desktop/packaging/windows-git-init.cmd.
+Original preview.7.4 source-manifest hash matches bdc3bdf15 windows-hooks.nsh, which already contains SetOutPath for Git.
+b9349e200774da9ebb7e261ed60236e6d8492f6dd31e1aabbce8034cd13d9878  Codewhale-MedSci_0.1.0-preview.7.5_windows-x64_internal-setup.exe

@@ -198,3 +198,4 @@ desktop/runtime/git-bash/
 apps/desktop/src-tauri/resources/git-bash/
 desktop/runtime/vc-redist/
 desktop/test-wine-webview2/
+!desktop/packaging/windows-git-init.cmd

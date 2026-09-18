@@ -2,7 +2,7 @@
 import hashlib,json,pathlib,struct,subprocess,tempfile
 root=pathlib.Path(__file__).resolve().parents[2]
 artifacts=root/'desktop/artifacts'
-installer=artifacts/'Codewhale-MedSci_0.1.0-preview.7.4_windows-x64_internal-setup.exe'
+installer=artifacts/'Codewhale-MedSci_0.1.0-preview.7.5_windows-x64_internal-setup.exe'
 stage=artifacts/'stage-windows-x86_64'
 def digest(path):return hashlib.sha256(path.read_bytes()).hexdigest()
 assert digest(installer)==installer.with_suffix('.exe.sha256').read_text().split()[0]
@@ -11,6 +11,9 @@ assert 'Everything is Ok' in result.stdout,result.stdout
 with tempfile.TemporaryDirectory(prefix='windows-payload-',dir=artifacts) as temporary:
     extracted=pathlib.Path(temporary)
     subprocess.run(['7z','x','-y',f'-o{extracted}',str(installer)],stdout=subprocess.DEVNULL,check=True)
+    init_scripts=list(extracted.rglob('medsci-git-init.cmd'))
+    assert len(init_scripts)==1,init_scripts
+    assert digest(init_scripts[0])==digest(root/'desktop/packaging/windows-git-init.cmd')
     candidates=list(extracted.rglob('medsci-desktop.exe'))
     assert len(candidates)==1,candidates
     payload=candidates[0].parent

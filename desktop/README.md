@@ -76,3 +76,5 @@ desktop/scripts/build-local.sh
 - Windows preview.7.3：随包提供完整 x64 Visual C++ CRT（包括 MSVCP140），首次创建或升级共享环境时复制并验证 DLL。内部 Python 子进程统一 UTF-8；旧编码输出按 UTF-8、系统 ANSI 代码页、GB18030 依次解码，失败的原始字节保留在 `%LOCALAPPDATA%/Codewhale-MedSci/python/shared/logs`。不修改系统代码页。
 
 - Windows preview.7.4：内置官方 PortableGit 2.55.0.windows.5（含 Git Bash）。Agent 默认使用包内 usr/bin/bash.exe；仅为应用进程设置 SHELL/PATH/MSYSTEM 与 UTF-8 locale，不修改系统 PATH，也不依赖用户安装 Git、PowerShell 7 或 WSL。启动时自检 Bash、当前目录和 Git；失败或超时会明确提示。安装时执行官方 post-install.bat，卸载移除私有 Git 运行时。
+
+- Windows 安装程序修订版 preview.7.5：修复 Git 初始化成功自删后返回 1 被误判为安装失败的问题。使用系统 cmd 的绝对路径入口、明确工作目录和进程内包优先 PATH；检查批处理与 post-install 目录清理后再运行包内 Bash/Git 自检。初始化未完成、自检失败和超时仍中止安装，详情写入安装日志。应用与 Agent 二进制沿用 preview.7.4；原生 Windows 安装复验仍待完成。
