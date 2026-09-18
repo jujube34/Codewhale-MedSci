@@ -7183,6 +7183,28 @@ impl RuntimeThreadManager {
         Ok(split)
     }
 
+    /// Estimated current retained context, never the sum of billed turn inputs.
+    pub async fn desktop_context_usage(&self, id: &str) -> Result<Value> {
+        let thread = self.get_thread(id).await?;
+        let total = {
+            let config = self.read_config();
+            self.resolved_route_for_thread(&config, &thread)?
+                .context_window
+                .tokens
+        };
+        let engine = self.get_engine(id).await?;
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            engine.get_session_snapshot(),
+        )
+        .await??;
+        let used = crate::compaction::estimate_input_tokens_conservative(
+            &snapshot.messages,
+            snapshot.system_prompt.as_ref(),
+        );
+        Ok(json!({"used_tokens":used,"total_tokens":total,"estimated":true}))
+    }
+
     pub async fn get_thread(&self, id: &str) -> Result<ThreadRecord> {
         self.flush_recovery_receipts_for_thread(id).await?;
         self.store
@@ -10284,6 +10306,9 @@ impl RuntimeThreadManager {
             .saved_session_prefix(thread, &turns)?
             .unwrap_or_default();
         messages.extend(self.reconstruct_messages_from_turns(&turns[covered..])?);
+        // Same recovery used by the TUI's SessionManager. Apply only after
+        // checkpoint verification, once the complete history is assembled.
+        crate::tool_history_repair::repair_tool_call_pairs(&mut messages);
         Ok(messages)
     }
 
@@ -10420,7 +10445,9 @@ impl RuntimeThreadManager {
                             });
                         }
                     }
-                    TurnItemKind::ToolCall => {
+                    TurnItemKind::ToolCall
+                    | TurnItemKind::CommandExecution
+                    | TurnItemKind::FileChange => {
                         let meta = item.metadata.as_ref();
                         let meta_str = |key: &str| {
                             meta.and_then(|m| m.get(key))
@@ -10973,6 +11000,11 @@ impl RuntimeThreadManager {
                                 item.summary =
                                     summarize_text(&format!("{name} failed: {err}"), SUMMARY_LIMIT);
                                 item.detail = Some(err.to_string());
+                                // Errors and cancellation are terminal tool results too.
+                                // Keep the original call metadata for a resumable pair.
+                                let metadata = item.metadata.get_or_insert_with(|| json!({}));
+                                metadata["tool_result_for"] = json!(id);
+                                metadata["is_error"] = json!(true);
                             }
                         }
                         self.store.save_item(&item)?;

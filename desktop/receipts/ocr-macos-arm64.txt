@@ -1,0 +1,8 @@
+[INFO] 2026-09-18 11:53:29,419 [RapidOCR] base.py:23: Using engine_name: onnxruntime
+[INFO] 2026-09-18 11:53:29,421 [RapidOCR] main.py:63: Using /Users/yfz/Codewhale-MedSci/desktop/test-runtime/current/lib/python3.12/site-packages/rapidocr/models/PP-OCRv6_det_small.onnx
+[INFO] 2026-09-18 11:53:29,606 [RapidOCR] base.py:23: Using engine_name: onnxruntime
+[INFO] 2026-09-18 11:53:29,607 [RapidOCR] main.py:63: Using /Users/yfz/Codewhale-MedSci/desktop/test-runtime/current/lib/python3.12/site-packages/rapidocr/models/ch_ppocr_mobile_v2.0_cls_mobile.onnx
+[INFO] 2026-09-18 11:53:29,674 [RapidOCR] base.py:23: Using engine_name: onnxruntime
+[INFO] 2026-09-18 11:53:29,674 [RapidOCR] main.py:63: Using /Users/yfz/Codewhale-MedSci/desktop/test-runtime/current/lib/python3.12/site-packages/rapidocr/models/PP-OCRv6_rec_small.onnx
+
+PASS: offline CPU OCR recognized Chinese and English with boxes and confidence.

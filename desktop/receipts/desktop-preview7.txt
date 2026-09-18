@@ -1,0 +1,11 @@
+running 7 tests
+test tests::endpoints_reject_credential_leaks ... ok
+test tests::aliases_are_endpoint_scoped ... ok
+test tests::errors_hide_secrets ... ok
+test tests::launchpad_defaults_to_home_but_explicit_workspace_wins ... ok
+test tests::native_history_is_the_only_rendered_session ... ok
+test tests::reasoning_stream_preserves_text_order_and_final_response ... ok
+test tests::workspace_rejects_files_and_relative_paths ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

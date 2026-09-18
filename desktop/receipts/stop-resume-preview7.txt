@@ -1,0 +1,1 @@
+PASS: interrupted live bash persists paired tool result; follow-up works in same process and after native session restart; strict provider rejects unpaired calls

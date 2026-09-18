@@ -1,0 +1,1 @@
+PASS: mid-turn approval denial prevented the file write; no real API key or vendor calls

@@ -1,0 +1,6 @@
+PASS: before Traceback (most recent call last):
+  File "Z:\Users\yfz\Codewhale-MedSci\desktop\artifacts\dll-regression-hn0cyuv0\probe.py", line 3, in <module>
+    import _extra
+ImportError: DLL load failed while importing _extra: 找不到模块。
+PASS: after IMPORT PASSED
+2 checks passed; 0 failed. Wine builtin MSVCP disabled; actual PyMuPDF extension used.

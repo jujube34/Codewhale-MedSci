@@ -1,0 +1,5 @@
+PASS: shared runtime initialize
+PASS: shared runtime check
+PASS: shared runtime initialize
+
+PASS under Wine: fresh offline Windows environment, all core imports/CPU ONNX, pip check, published environment recheck/reuse, Unicode/spaced path. No real model calls.

@@ -15333,6 +15333,40 @@ fn restart_rebuild_keeps_in_flight_tool_call_identity() -> Result<()> {
         other => panic!("expected in-flight tool call identity, got {other:?}"),
     }
 
+    // Full recovery must reuse TUI pair repair for old failed/interrupted
+    // snapshots, including command/file tool item kinds.
+    for kind in [
+        TurnItemKind::ToolCall,
+        TurnItemKind::CommandExecution,
+        TurnItemKind::FileChange,
+    ] {
+        for status in [
+            TurnItemLifecycleStatus::Failed,
+            TurnItemLifecycleStatus::Interrupted,
+            TurnItemLifecycleStatus::InProgress,
+        ] {
+            let mut old = call_item.clone();
+            old.kind = kind;
+            old.status = status;
+            manager.store.save_item(&old)?;
+            let recovered = manager.restore_thread_messages(&thread)?;
+            assert!(
+                recovered
+                    .iter()
+                    .flat_map(|m| &m.content)
+                    .any(|block| matches!(block,
+                        ContentBlock::ToolResult { tool_use_id, is_error: Some(true), content, .. }
+                        if tool_use_id == "call_00_def" && content.contains("crashed_and_repaired")
+                    )),
+                "missing recovered result for {kind:?}/{status:?}"
+            );
+            let mut repaired_twice = recovered.clone();
+            assert!(
+                crate::tool_history_repair::repair_tool_call_pairs(&mut repaired_twice).is_empty()
+            );
+            assert_eq!(recovered, repaired_twice);
+        }
+    }
     let _ = std::fs::remove_dir_all(dir);
     Ok(())
 }

@@ -1,0 +1,1 @@
+{"name":"medsci-desktop","private":true,"version":"0.1.0-preview.7","scripts":{"build:ui":"wasm-pack build ui --target web --out-dir ../dist/pkg --release && node copy-assets.mjs","build":"npm run build:ui && tauri build","dev":"npm run build:ui && tauri dev"},"devDependencies":{"@tauri-apps/cli":"^2.0.0"}}

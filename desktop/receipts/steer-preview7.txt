@@ -1,0 +1,2 @@
+PASS: native steer accepted mid-stream, reached the model in the same turn, and persisted in native history; no extra turn/session
+PASS: native mid-turn steer round-trip completed; no real API key or vendor calls

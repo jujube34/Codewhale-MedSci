@@ -1,0 +1,2 @@
+PASS: NSIS integrity, SHA-256, 3390 extracted payload files match staging, x64 PE binaries, VC runtime DLLs, source provenance, and all offline wheel hashes
+Native Windows install/uninstall, WebView2 and GUI behavior remain unverified on this macOS host.

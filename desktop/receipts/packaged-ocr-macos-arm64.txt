@@ -1,0 +1,1 @@
+PASS: fresh package-derived Python environment; image and two-page scanned PDF OCR recognized Chinese/English, with coordinates, confidence and reading order. OCR runner disables socket connections and selects CPU engines.

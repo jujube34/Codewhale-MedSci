@@ -476,7 +476,7 @@ fn resolver_uncatalogued_deepseek_preview_keeps_chat_and_verbatim_model() {
 }
 
 #[test]
-fn resolver_routes_deepseek_vision_exp_over_chat_with_image_input() {
+fn resolver_migrates_deepseek_vision_exp_to_canonical_flash() {
     for base_url_override in [
         None,
         Some("https://api.deepseek.com/v1"),
@@ -495,14 +495,11 @@ fn resolver_routes_deepseek_vision_exp_over_chat_with_image_input() {
         assert_eq!(route.provider_kind(), ProviderKind::Deepseek);
         assert_eq!(
             route.canonical_model().map(ModelId::as_str),
-            Some("deepseek-v4-flash-vision-exp")
+            Some("deepseek-flash")
         );
-        assert_eq!(
-            route.wire_model_id().as_str(),
-            "deepseek-v4-flash-vision-exp"
-        );
-        assert_eq!(route.protocol(), RequestProtocol::ChatCompletions);
-        assert_eq!(route.endpoint().endpoint_key, "chat");
+        assert_eq!(route.wire_model_id().as_str(), "deepseek-flash");
+        assert_eq!(route.protocol(), RequestProtocol::Responses);
+        assert_eq!(route.endpoint().endpoint_key, "responses");
         assert_eq!(
             route.capabilities().image_input,
             CapabilityState::Supported,

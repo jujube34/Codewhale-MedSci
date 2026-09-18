@@ -224,6 +224,8 @@ fn is_allowed_parent_env_key(key: &OsStr) -> bool {
             | "NO_COLOR"
             | "FORCE_COLOR"
             | "SHELL"
+            // Preserve the selected Git Bash/MSYS subsystem for shell children.
+            | "MSYSTEM"
             | "TMPDIR"
             | "TMP"
             | "TEMP"
@@ -603,6 +605,7 @@ mod tests {
             "TERM",
             "LANG",
             "SHELL",
+            "MSYSTEM",
             "LIB",
             "LIBPATH",
             "INCLUDE",

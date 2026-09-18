@@ -1,0 +1,2 @@
+PASS under Wine isolated test prefix: actual shared NSIS install hook created both Explorer registry menu entries. Windows CPython winreg verified Chinese labels; CommandLineToArgvW verified executable path with spaces and exact workspace arguments for Unicode/spaced paths and drive roots. Windows 11 native Explorer UI remains untested.
+PASS under Wine: shared uninstall hook removed both Explorer registry entries.

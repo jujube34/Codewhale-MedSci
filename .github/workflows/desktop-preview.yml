@@ -1,0 +1,62 @@
+name: Desktop internal preview
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/desktop -> target
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.8"
+      - run: cargo install wasm-pack --locked
+      - run: cargo test -p codewhale-config --lib route::tests --locked
+      - run: cargo build --release --locked -p codewhale-cli
+      - name: Stage sidecar
+        shell: bash
+        run: |
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
+          cp "target/release/codewhale$suffix" "apps/desktop/src-tauri/resources/codewhale$suffix"
+          python desktop/scripts/protocol-smoke.py "target/release/codewhale$suffix"
+      - name: Prepare native offline Python payload
+        shell: bash
+        run: python desktop/scripts/prepare-runtime.py
+      - run: npm ci
+        working-directory: apps/desktop
+      - run: npm run build:ui
+        working-directory: apps/desktop
+      - run: cargo test --manifest-path apps/desktop/Cargo.toml -p medsci-desktop --locked
+      - run: npx tauri build --target ${{ matrix.target }}
+        working-directory: apps/desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: internal-unsigned-${{ matrix.target }}
+          path: apps/desktop/target/${{ matrix.target }}/release/bundle/
+          if-no-files-found: error

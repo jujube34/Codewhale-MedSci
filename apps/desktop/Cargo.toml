@@ -1,0 +1,8 @@
+[workspace]
+members = ["ui", "src-tauri"]
+resolver = "2"
+[profile.release]
+strip = true
+lto = "thin"
+[profile.dev]
+debug = 0

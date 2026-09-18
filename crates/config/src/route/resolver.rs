@@ -325,6 +325,17 @@ impl RouteResolver {
         //    Prefixed selectors are preserved VERBATIM as the wire id.
         let custom_endpoint =
             request_uses_custom_endpoint(&descriptor, req.base_url_override.as_deref());
+        // Legacy Flash IDs migrate only on the official provider endpoint.
+        let logical_model = if provider_kind == ProviderKind::Deepseek
+            && !custom_endpoint
+            && matches!(
+                logical_model.raw(),
+                "deepseek-v4-flash" | "deepseek-v4-flash-vision-exp"
+            ) {
+            LogicalModelRef::from("deepseek-flash")
+        } else {
+            logical_model
+        };
         let class = if custom_endpoint {
             ProviderClass::LocalOrCustom
         } else {

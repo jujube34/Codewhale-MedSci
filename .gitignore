@@ -170,3 +170,31 @@ crates/tui/plugins/computer-use/receipts/
 # Portable pet build entry points are source.
 !pet/**/*.sh
 !pet/verify.sh
+
+# MedSci desktop sources; generated runtimes and build products stay local.
+!apps/
+apps/*
+!apps/desktop/
+apps/desktop/target/
+apps/desktop/dist/
+apps/desktop/node_modules/
+apps/desktop/src-tauri/resources/codewhale*
+apps/desktop/src-tauri/resources/python/
+desktop/runtime/cpython/
+desktop/runtime/wheelhouse/
+desktop/test-runtime/
+desktop/artifacts/
+desktop/runtime/windows-x86_64/
+desktop/runtime/macos-x86_64/
+target-windows/
+desktop/packaging/finder/build/
+desktop/runtime/target-requirements.txt
+desktop/test-wine/
+desktop/windows-sdk/
+apps/desktop/src-tauri/resources/build-provenance.json
+desktop/packaging/MicrosoftEdgeWebview2Setup.exe
+
+desktop/runtime/git-bash/
+apps/desktop/src-tauri/resources/git-bash/
+desktop/runtime/vc-redist/
+desktop/test-wine-webview2/

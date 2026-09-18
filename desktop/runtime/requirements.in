@@ -1,0 +1,16 @@
+python-docx
+python-pptx
+pandas
+openpyxl
+PyMuPDF
+pypdf
+reportlab
+Pillow
+matplotlib
+numpy
+beautifulsoup4
+lxml
+rapidocr
+onnxruntime
+
+omegaconf==2.3.0

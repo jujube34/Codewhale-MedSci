@@ -704,7 +704,6 @@ impl Engine {
         // not become a paid summarization loop at every tool boundary.
         // The bounded hard-limit recovery below remains available.
         let mut auto_compaction_suppressed = false;
-        let mut image_rejection_recovered = false;
         let mut tool_policy = tool_policy;
         let mut mode = tool_policy.mode;
         let mut questions_allowed = tool_policy.allows_questions();
@@ -1439,21 +1438,18 @@ impl Engine {
                     .max_tokens
                     .min(client.effective_max_output_tokens(&self.session.model));
             }
-            // Normalize images against the route this request is actually
-            // going to. Session history keeps the real image so that switching
-            // to a vision-capable model later makes it visible again; only the
-            // outbound copy is rewritten, and it is rewritten to text that says
-            // why rather than being dropped.
-            let stripped_images = crate::image_attach::strip_images_when_unsupported(
-                &mut request.messages,
-                self.active_route_capabilities.image_input,
-                &self.session.model,
-            );
-            if stripped_images > 0 {
-                crate::logging::warn(format!(
-                    "{stripped_images} image block(s) replaced with text: model {} does not accept image input",
-                    self.session.model
-                ));
+            // Never convert a visual task into a text-only request silently.
+            // Probe a copy, leaving the original history and attachments intact.
+            if self.active_route_capabilities.image_input == CapabilityState::Unsupported {
+                let mut probe = request.messages.clone();
+                if crate::image_attach::strip_images_when_unsupported(
+                    &mut probe,
+                    self.active_route_capabilities.image_input,
+                    &self.session.model,
+                ) > 0
+                {
+                    return (TurnOutcomeStatus::Failed, Some("Image input is unavailable for this route; select a vision model or explicitly choose local OCR.".to_string()));
+                }
             }
             let tool_request_snapshot =
                 crate::tool_inspection::ToolInspectionSnapshot::from_prepared_request_with_surface(
@@ -1551,24 +1547,9 @@ impl Engine {
                         context_recovery_attempts = context_recovery_attempts.saturating_add(1);
                         continue;
                     }
-                    if is_image_input_rejection_message(&message)
-                        && self.active_route_capabilities.image_input
-                            != CapabilityState::Unsupported
-                        && !image_rejection_recovered
-                    {
-                        image_rejection_recovered = true;
+                    if is_image_input_rejection_message(&message) {
                         self.active_route_capabilities.image_input = CapabilityState::Unsupported;
-                        crate::logging::warn(format!(
-                            "model {} rejected image content; resending with images replaced by text",
-                            self.session.model
-                        ));
-                        let status = codewhale_localization::tr(
-                            codewhale_localization::resolve_locale(&self.config.locale_tag),
-                            codewhale_localization::MessageId::ImageInputRejectedResent,
-                        )
-                        .replace("{model}", &self.session.model);
-                        let _ = self.tx_event.send(Event::status(status)).await;
-                        continue;
+                        // Fall through to the terminal error. No automatic image-free retry.
                     }
                     let display_message = self.decorate_auth_error_message(
                         initial_stream_error_user_message(&self.config.locale_tag, &e),

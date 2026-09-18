@@ -1,0 +1,2 @@
+PASS: durable runtime history restored after process restart; context estimate available; cross-workspace session selection rejected; separate workspace gets a distinct session
+PASS: full access executed an out-of-workspace fixture write without an approval prompt; no real API key or vendor calls

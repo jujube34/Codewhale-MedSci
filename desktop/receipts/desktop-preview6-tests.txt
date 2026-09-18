@@ -1,0 +1,15 @@
+   Compiling medsci-desktop v0.1.0-preview.6 (/Users/yfz/Codewhale-MedSci/apps/desktop/src-tauri)
+    Finished `test` profile [unoptimized] target(s) in 2.49s
+     Running unittests src/main.rs (apps/desktop/target/debug/deps/medsci_desktop-fec346f9fdfede8b)
+
+running 7 tests
+test tests::workspace_rejects_files_and_relative_paths ... ok
+test tests::launchpad_defaults_to_home_but_explicit_workspace_wins ... ok
+test tests::errors_hide_secrets ... ok
+test tests::reasoning_stream_preserves_text_order_and_final_response ... ok
+test tests::native_history_is_the_only_rendered_session ... ok
+test tests::endpoints_reject_credential_leaks ... ok
+test tests::aliases_are_endpoint_scoped ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

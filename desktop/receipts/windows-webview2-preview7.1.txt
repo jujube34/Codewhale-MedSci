@@ -1,0 +1,8 @@
+PASS: old production nonzero-exit check reproduces failure for -2147219416
+PASS: user-present
+PASS: machine-present
+PASS: missing-installed
+PASS: zero-version
+PASS: empty-version
+PASS: real-failure
+7 checks passed; 0 failed. Fixtures test NSIS control flow and registry detection, not real WebView2 installation.

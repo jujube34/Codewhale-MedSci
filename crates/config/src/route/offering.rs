@@ -256,6 +256,19 @@ pub fn bundled_offerings() -> Vec<ProviderModelOffering> {
     let mut offerings = vec![
         ProviderModelOffering {
             provider: deepseek.clone(),
+            canonical_model: Some(ModelId::from("deepseek-flash")),
+            wire_model_id: WireModelId::from("deepseek-flash"),
+            endpoint_key: "responses".to_string(),
+            default_for_provider: false,
+            limits: documented_limits,
+            capabilities: RouteCapabilities {
+                image_input: CapabilityState::Supported,
+                ..documented_capabilities
+            },
+            pricing: PricingSku::UnknownOrStale,
+        },
+        ProviderModelOffering {
+            provider: deepseek.clone(),
             canonical_model: Some(ModelId::from("deepseek-v4-pro")),
             wire_model_id: WireModelId::from("deepseek-v4-pro"),
             endpoint_key: "chat".to_string(),

@@ -1,0 +1,3 @@
+PASS: browser fixture using production CSS and the production scroll observer: user message right-aligned, assistant/tool messages without bubbles.
+PASS: 30 appended messages => bottom gap 0px; streamed text update => bottom gap 0.5px (subpixel rounding).
+The fixture uses sample messages, not a real provider conversation. Native WKWebView visual verification remains manual.

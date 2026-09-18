@@ -1,0 +1,1 @@
+PASS under Wine: packaged Windows x64 sidecar health, native session/steer capabilities, thread/start, shutdown; no model/provider calls

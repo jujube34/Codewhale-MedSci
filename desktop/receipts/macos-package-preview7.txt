@@ -1,0 +1,3 @@
+hdiutil: verify: checksum of "/Users/yfz/Codewhale-MedSci/desktop/artifacts/Codewhale-MedSci_0.1.0-preview.7_arm64_internal.dmg" is VALID
+PASS: sidecar version, desktop capabilities, thread/start, shutdown; no credentials or provider calls
+PASS: DMG checksum/integrity, read-only mount, deep code signature, build provenance and all wheel hashes

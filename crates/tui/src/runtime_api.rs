@@ -4367,6 +4367,7 @@ async fn get_thread(
 struct ThreadUsageResponse {
     thread_id: String,
     totals: UsageTotals,
+    context: Option<Value>,
 }
 
 async fn get_thread_usage(
@@ -4379,9 +4380,11 @@ async fn get_thread_usage(
         .await
         .map_err(map_thread_err)?
         .combined();
+    let context = state.runtime_threads.desktop_context_usage(&id).await.ok();
     Ok(Json(ThreadUsageResponse {
         thread_id: id,
         totals,
+        context,
     }))
 }
 

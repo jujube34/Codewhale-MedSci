@@ -1,0 +1,1 @@
+PASS: sidecar version, desktop capabilities, thread/start, shutdown; no credentials or provider calls

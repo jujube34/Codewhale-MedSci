@@ -1,0 +1,45 @@
+antlr4-python3-runtime==4.9.3
+beautifulsoup4==4.15.0
+certifi==2026.7.22
+charset-normalizer==3.5.1
+colorlog==6.12.0
+contourpy==1.4.0
+cycler==0.12.1
+et_xmlfile==2.0.0
+flatbuffers==25.12.19
+fonttools==4.65.0
+idna==3.20
+kiwisolver==1.5.1
+lxml==6.1.3
+matplotlib==3.11.2
+numpy==2.5.3
+omegaconf==2.3.0
+onnxruntime==1.30.0
+opencv-python==5.0.0.93
+openpyxl==3.1.5
+packaging==26.3
+pandas==3.0.6
+pillow==12.3.0
+protobuf==7.36.2
+pyclipper==1.4.0
+pymupdf==1.28.2
+pyparsing==3.3.2
+pypdf==6.19.0
+python-dateutil==2.9.0.post0
+python-docx==1.2.0
+python-pptx==1.0.2
+PyYAML==6.0.3
+rapidocr==3.9.2
+reportlab==5.0.1
+requests==2.34.2
+shapely==2.1.2
+six==1.17.0
+soupsieve==2.9.2
+tqdm==4.70.1
+typing_extensions==4.16.0
+urllib3==2.8.0
+xlsxwriter==3.2.9
+
+# Windows-only transitive dependencies must also be pinned for cross packaging.
+colorama==0.4.6; sys_platform == "win32"
+tzdata==2026.4; sys_platform == "win32"

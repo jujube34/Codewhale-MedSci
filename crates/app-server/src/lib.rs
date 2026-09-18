@@ -485,6 +485,13 @@ where
                         match line? {
                             None => {
                                 stdin_open = false;
+                                // A desktop-owned pipe disappearing means its supervisor
+                                // has crashed. Drop the bridge and its Runtime child now.
+                                // Ordinary piped CLI prompts retain their EOF behavior.
+                                if policy.transport == AppTransport::Stdio
+                                    && std::env::var_os("CODEWHALE_DESKTOP_SUPERVISED").is_some() {
+                                    return Ok(StdioLoopExit::InputClosed);
+                                }
                                 // Release the claim here, not after `dispatch`
                                 // resolves.
                                 drop(input_claim.take());
@@ -591,6 +598,16 @@ async fn handle_line_during_turn(
     };
 
     match request.method.as_str() {
+        "desktop/approval" | "desktop/user-input" | "thread/steer" => {
+            let response =
+                match desktop_decision(state, &request.method, params_or_object(request.params))
+                    .await
+                {
+                    Ok(value) => jsonrpc_result(request.id, value),
+                    Err(err) => jsonrpc_error(request.id, err),
+                };
+            pending.push_back(PendingStdioWork::Response(response));
+        }
         "thread/interrupt" => {
             let id = request.id.clone();
             let response = match parse_params::<ThreadInterruptParams>(params_or_object(
@@ -1177,6 +1194,26 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
     if let Some(model) = turn.model_override {
         hint.get_or_insert_with(RuntimeThreadHint::default).model = Some(model);
     }
+    // Carry the configured product posture into the actual Runtime thread.
+    // Without this, the stdio layer silently creates Ask threads even when
+    // its host explicitly selected Full Access.
+    let config = state.config.read().await;
+    let policy = config.approval_policy.clone();
+    let full_access = policy.as_deref() == Some("auto")
+        && config.sandbox_mode.as_deref() == Some("danger-full-access");
+    drop(config);
+    let permission_posture = if full_access {
+        Some("full_access")
+    } else {
+        match policy
+            .as_deref()
+            .and_then(codewhale_execpolicy::ApprovalMode::from_config_value)
+        {
+            Some(codewhale_execpolicy::ApprovalMode::Bypass) => Some("full_access"),
+            Some(codewhale_execpolicy::ApprovalMode::Auto) => Some("auto_review"),
+            _ => None,
+        }
+    };
     let bridge = acquire_runtime_bridge(state).await?;
     // The inner bridge lock is held for the whole turn: one child process
     // serves all threads and per-thread seq tracking requires ordered
@@ -1211,7 +1248,7 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
         }
     }
     let runtime_thread_id = bridge
-        .ensure_runtime_thread(turn.thread_key, hint)
+        .ensure_runtime_thread(turn.thread_key, hint, permission_posture)
         .await
         .map_err(|err| JsonRpcError::runtime_unavailable(err.to_string()))?;
     let registration = turn
@@ -1457,6 +1494,212 @@ async fn interrupt_stdio_turn(
     Ok(true)
 }
 
+/// Desktop sessions reuse durable Runtime threads, including tool history.
+async fn desktop_session(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, JsonRpcError> {
+    let key = params["thread_id"]
+        .as_str()
+        .ok_or_else(|| JsonRpcError::invalid_params("missing thread_id"))?;
+    let hint = state
+        .stdio_thread_hints
+        .lock()
+        .await
+        .get(key)
+        .cloned()
+        .ok_or_else(|| JsonRpcError::invalid_params("unknown desktop thread"))?;
+    let workspace = hint
+        .workspace
+        .as_ref()
+        .ok_or_else(|| JsonRpcError::invalid_params("missing workspace"))?
+        .canonicalize()
+        .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
+    let full = {
+        let config = state.config.read().await;
+        config.approval_policy.as_deref() == Some("auto")
+            && config.sandbox_mode.as_deref() == Some("danger-full-access")
+    };
+    let shared = acquire_runtime_bridge(state).await?;
+    let mut bridge = shared.lock().await;
+    // The Runtime store is the sole session authority; desktop only projects it.
+    let operation = params["operation"].as_str().unwrap_or("read");
+    let mut latest = None;
+    if matches!(operation, "list" | "latest") {
+        let records = bridge
+            .request_json(
+                bridge.authed(bridge.client.get(format!("{}/v1/threads", bridge.base_url))),
+            )
+            .await
+            .map_err(|e| JsonRpcError::runtime_unavailable(e.to_string()))?;
+        let mut sessions = Vec::new();
+        for record in records.as_array().into_iter().flatten() {
+            if record["workspace"]
+                .as_str()
+                .and_then(|p| Path::new(p).canonicalize().ok())
+                .as_ref()
+                != Some(&workspace)
+            {
+                continue;
+            }
+            if latest.is_none() {
+                latest = record["id"].as_str().map(str::to_owned);
+            }
+            if operation == "list" {
+                let id = record["id"]
+                    .as_str()
+                    .ok_or_else(|| JsonRpcError::internal("Runtime session missing id"))?;
+                let detail = bridge
+                    .request_json(
+                        bridge.authed(
+                            bridge
+                                .client
+                                .get(format!("{}/v1/threads/{id}", bridge.base_url)),
+                        ),
+                    )
+                    .await
+                    .map_err(|e| JsonRpcError::runtime_unavailable(e.to_string()))?;
+                let title = record["title"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        detail["turns"]
+                            .as_array()
+                            .and_then(|t| t.first())
+                            .and_then(|t| t["input_summary"].as_str())
+                    })
+                    .unwrap_or("新会话");
+                sessions.push(json!({"id":id,"title":title,"updated":record["updated_at"]}));
+            }
+        }
+        if operation == "list" {
+            return Ok(json!(sessions));
+        }
+    }
+    if operation == "new" {
+        bridge.thread_map.remove(key);
+    }
+    let selected = params["runtime_id"].as_str().or(latest.as_deref());
+    let id = if let Some(id) = selected {
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(JsonRpcError::invalid_params("invalid runtime session id"));
+        }
+        id.to_owned()
+    } else {
+        bridge
+            .ensure_runtime_thread(key, Some(hint.clone()), full.then_some("full_access"))
+            .await
+            .map_err(|e| JsonRpcError::runtime_unavailable(e.to_string()))?
+    };
+    let url = format!("{}/v1/threads/{id}", bridge.base_url);
+    let detail = bridge
+        .request_json(bridge.authed(bridge.client.get(&url)))
+        .await
+        .map_err(|e| JsonRpcError::runtime_unavailable(e.to_string()))?;
+    let stored_workspace = detail
+        .pointer("/thread/workspace")
+        .and_then(Value::as_str)
+        .and_then(|p| Path::new(p).canonicalize().ok());
+    if stored_workspace.as_ref() != Some(&workspace) {
+        return Err(JsonRpcError::invalid_params(
+            "session belongs to another workspace",
+        ));
+    }
+    if full && selected.is_some() {
+        bridge.request_json(bridge.authed(bridge.client.patch(&url)).json(&json!({
+            "permission_posture":"full_access", "trust_mode":true, "allow_shell":true, "model":hint.model
+        }))).await.map_err(|e| JsonRpcError::runtime_unavailable(e.to_string()))?;
+    }
+    bridge.thread_map.insert(key.to_owned(), id.clone());
+    bridge
+        .last_seq_by_thread
+        .insert(id.clone(), detail["latest_seq"].as_u64().unwrap_or(0));
+    let usage = bridge
+        .request_json(bridge.authed(bridge.client.get(format!("{url}/usage"))))
+        .await
+        .ok();
+    Ok(json!({"runtime_id":id,"usage":usage,"detail":detail}))
+}
+
+/// Mid-turn desktop decisions use the copied live-turn address, never the
+/// streaming bridge mutex. Runtime still validates single-use capabilities.
+async fn desktop_decision(
+    state: &AppState,
+    method: &str,
+    params: Value,
+) -> std::result::Result<Value, JsonRpcError> {
+    let thread = params
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| JsonRpcError::internal("missing thread_id".to_string()))?;
+    let turn = state
+        .in_flight_turns
+        .lock()
+        .await
+        .get(thread)
+        .cloned()
+        .ok_or_else(|| JsonRpcError::internal("no active turn".to_string()))?;
+    let (path, body) = if method == "thread/steer" {
+        let prompt = params["prompt"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| JsonRpcError::invalid_params("prompt is required"))?;
+        (
+            format!(
+                "/v1/threads/{}/turns/{}/steer",
+                turn.runtime_thread_id, turn.turn_id
+            ),
+            json!({"prompt":prompt}),
+        )
+    } else {
+        let id = params
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|v| {
+                !v.is_empty()
+                    && v.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            })
+            .ok_or_else(|| JsonRpcError::internal("invalid decision capability".to_string()))?;
+        let decision = if method == "desktop/approval" {
+            let decision = params
+                .get("decision")
+                .and_then(Value::as_str)
+                .filter(|v| matches!(*v, "allow" | "deny"))
+                .ok_or_else(|| JsonRpcError::internal("invalid approval decision".to_string()))?;
+            (
+                format!("/v1/approvals/{id}"),
+                json!({"decision":decision,"remember":false}),
+            )
+        } else {
+            (
+                format!("/v1/user-input/{}/{id}", turn.runtime_thread_id),
+                json!({"answers":params["answers"]}),
+            )
+        };
+        decision
+    };
+    let client = codewhale_release::platform_http_client_builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+    let mut request = client.post(format!("{}{path}", turn.base_url)).json(&body);
+    if let Some(token) = turn.auth_token {
+        request = request.bearer_auth(token);
+    }
+    request
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| JsonRpcError::internal(format!("decision failed: {e}")))?;
+    Ok(json!({"accepted":true}))
+}
+
 /// Drop the cached runtime bridge so the next stdio thread message spawns a
 /// fresh child that re-reads the persisted config. An in-flight message
 /// keeps its own [`SharedRuntimeBridge`] clone and finishes against the old
@@ -1638,13 +1881,14 @@ impl RuntimeBridge {
         &mut self,
         stdio_thread_id: &str,
         hint: Option<RuntimeThreadHint>,
+        permission_posture: Option<&str>,
     ) -> Result<String> {
         if let Some(runtime_thread_id) = self.thread_map.get(stdio_thread_id) {
             return Ok(runtime_thread_id.clone());
         }
         let hint = hint.unwrap_or_default();
         let runtime_thread_id = self
-            .create_runtime_thread(hint.model, hint.workspace)
+            .create_runtime_thread(hint.model, hint.workspace, permission_posture)
             .await?;
         self.thread_map
             .insert(stdio_thread_id.to_string(), runtime_thread_id.clone());
@@ -1663,6 +1907,7 @@ impl RuntimeBridge {
         &mut self,
         model: Option<String>,
         workspace: Option<PathBuf>,
+        permission_posture: Option<&str>,
     ) -> Result<String> {
         let record = self
             .request_json(
@@ -1671,6 +1916,9 @@ impl RuntimeBridge {
                         "model": model,
                         "workspace": workspace,
                         "mode": "agent",
+                        "permission_posture": permission_posture,
+                        "trust_mode": permission_posture == Some("full_access"),
+                        "allow_shell": true,
                         "archived": false,
                     })),
             )
@@ -1875,6 +2123,20 @@ impl RuntimeBridge {
                     continue;
                 }
                 let payload = envelope.get("payload").cloned().unwrap_or(Value::Null);
+                // Additive tool/approval notifications; preserve the existing response frames.
+                if (event_name.starts_with("item.")
+                    || event_name == "turn.steered"
+                    || event_name.starts_with("approval.")
+                    || event_name.starts_with("user_input."))
+                    && !(event_name == "item.delta"
+                        && payload.get("kind").and_then(Value::as_str) == Some("agent_message"))
+                {
+                    emit_stdio_event(
+                        writer,
+                        json!({"type":"runtime_event", "event":event_name, "payload":payload}),
+                    )
+                    .await?;
+                }
                 match event_name.as_str() {
                     "item.delta" => {
                         let kind = payload
@@ -2057,6 +2319,7 @@ async fn dispatch_stdio_request_with_writer<W: AsyncWrite + Unpin>(
             result: json!({
                 "status": "ok",
                 "service": legacy_deepseek_compat::SERVICE_NAME,
+                "version": env!("CARGO_PKG_VERSION"),
                 "transport": transport.label()
             }),
             should_exit: false,
@@ -2067,6 +2330,10 @@ async fn dispatch_stdio_request_with_writer<W: AsyncWrite + Unpin>(
                 "thread/capabilities",
                 "thread/request",
                 "thread/create",
+                "desktop/approval",
+                "desktop/user-input",
+                "desktop/session",
+                "thread/steer",
                 "thread/start",
                 "thread/resume",
                 "thread/fork",
@@ -2195,6 +2462,14 @@ async fn dispatch_stdio_request_with_writer<W: AsyncWrite + Unpin>(
                 should_exit: false,
             }
         }
+        "desktop/session" => StdioDispatchResult {
+            result: desktop_session(state, params_or_object(params)).await?,
+            should_exit: false,
+        },
+        "desktop/approval" | "desktop/user-input" | "thread/steer" => StdioDispatchResult {
+            result: desktop_decision(state, method, params_or_object(params)).await?,
+            should_exit: false,
+        },
         "thread/start" => {
             let request = ThreadRequest::Start(parse_params(params_or_object(params))?);
             let response = handle_thread_request(state, request).await?;
@@ -3830,6 +4105,8 @@ mod tests {
         async fn create_thread(Json(body): Json<Value>) -> Json<Value> {
             assert_eq!(body["model"], "deepseek-v4");
             assert_eq!(body["workspace"], "/tmp/codewhale-stdio");
+            assert_eq!(body["permission_posture"], "full_access");
+            assert_eq!(body["trust_mode"], true);
             Json(json!({
                 "id": "thr_runtime",
                 "model": body["model"].clone(),
@@ -3857,6 +4134,7 @@ mod tests {
                     model: Some("deepseek-v4".to_string()),
                     workspace: Some(PathBuf::from("/tmp/codewhale-stdio")),
                 }),
+                Some("full_access"),
             )
             .await
             .expect("runtime thread");
@@ -4165,6 +4443,10 @@ mod tests {
         "thread/capabilities",
         "thread/request",
         "thread/create",
+        "desktop/approval",
+        "desktop/user-input",
+        "desktop/session",
+        "thread/steer",
         "thread/start",
         "thread/resume",
         "thread/fork",
@@ -4572,5 +4854,63 @@ mod tests {
             parse_stdio_line(&" ".repeat(MAX_RUNTIME_IMAGE_BODY_BYTES + 1)),
             ParsedStdioLine::Rejected(_)
         ));
+    }
+    #[tokio::test]
+    async fn desktop_approval_is_delivered_while_streaming_without_bridge_lock() {
+        async fn approve(AxumPath(id): AxumPath<String>, Json(body): Json<Value>) -> Json<Value> {
+            assert_eq!(id, "approval_fixture");
+            assert_eq!(body, json!({"decision":"deny","remember":false}));
+            Json(json!({"ok":true}))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/approvals/{id}", post(approve)),
+            )
+            .await
+            .unwrap();
+        });
+        let (state, _tmp) = capability_test_state();
+        state.in_flight_turns.lock().await.insert(
+            "desktop_thread".into(),
+            InFlightTurn {
+                base_url: format!("http://{addr}"),
+                auth_token: None,
+                runtime_thread_id: "runtime_thread".into(),
+                turn_id: "turn_fixture".into(),
+            },
+        );
+        // A queued request would hang until the turn ends. Hold the bridge slot
+        // as another guard that this path cannot wait on the streaming bridge.
+        let _guard = state.runtime_bridge.lock().await;
+        let mut pending = VecDeque::new();
+        let line=json!({"jsonrpc":"2.0","id":9,"method":"desktop/approval","params":{"thread_id":"desktop_thread","id":"approval_fixture","decision":"deny"}}).to_string();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            handle_line_during_turn(
+                &state,
+                &line,
+                &mut pending,
+                StdioLoopPolicy::process_stdio(),
+            ),
+        )
+        .await
+        .unwrap();
+        match pending.pop_front().unwrap() {
+            PendingStdioWork::Response(v) => assert_eq!(v["result"]["accepted"], true),
+            _ => panic!("approval must execute before the turn ends"),
+        }
+        assert!(
+            desktop_decision(
+                &state,
+                "desktop/approval",
+                json!({"thread_id":"desktop_thread","id":"../escape","decision":"allow"})
+            )
+            .await
+            .is_err()
+        );
+        server.abort();
     }
 }

@@ -1618,3 +1618,8 @@ matrix, no secrets leaked):
 scripts/release/app-server-smoke.sh --matrix        # dry-run plan
 bash scripts/release/app-server-smoke.test.sh       # parser self-test (fake binary)
 ```
+
+
+### MedSci desktop stdio extension
+
+`desktop/session` accepts a registered stdio `thread_id` and an optional durable `runtime_id`. It binds the stdio session to a Runtime thread after verifying the canonical workspace, returning `runtime_id` and provider-aware `/usage` data. Reopening a thread preserves the Runtime transcript; cross-workspace binding is rejected. The usage response additionally includes an optional estimated retained `context` (`used_tokens`, `total_tokens`, `estimated`), obtained from the engine snapshot rather than accumulated billed tokens. The snapshot is bounded by a timeout and can be unavailable. Full Access desktop launches explicitly set Runtime `permission_posture=full_access`, `trust_mode=true`, and `allow_shell=true`; ordinary clients keep their configured posture.

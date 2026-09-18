@@ -1,0 +1,16 @@
+PASS: shared runtime initialize
+PASS: shared runtime check
+PASS: shared runtime initialize
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+Traceback (most recent call last):
+  File "Z:\Users\yfz\Codewhale-MedSci\desktop\artifacts\windows-runtime-hy4voktg\driver.py", line 7, in <module>
+    subprocess.run([str(home/"current/Scripts/python.exe"),"-I",'Z:\\Users\\yfz\\Codewhale-MedSci\\desktop\\tests\\document_smoke.py'],check=True)
+  File "Z:\Users\yfz\Codewhale-MedSci\desktop\artifacts\stage-windows-x86_64\resources\python\cpython\Lib\subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['Z:\\Users\\yfz\\Codewhale-MedSci\\desktop\\artifacts\\windows-runtime-hy4voktg\\�û� shared\\current\\Scripts\\python.exe', '-I', 'Z:\\Users\\yfz\\Codewhale-MedSci\\desktop\\tests\\document_smoke.py']' returned non-zero exit status 3221226505.
+
+Traceback (most recent call last):
+  File "/Users/yfz/Codewhale-MedSci/desktop/tests/windows-runtime.py", line 20, in <module>
+    assert result.returncode==0,result.returncode
+           ^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1

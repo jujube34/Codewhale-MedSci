@@ -1159,7 +1159,7 @@ api_key = {provider_api_key:?}
                 let endpoint = resolve_endpoint(&config, &registry, Some(alias))
                     .expect("official DeepSeek route");
                 assert_eq!(endpoint.provider, ProviderKind::Deepseek, "{base_url}");
-                assert_eq!(endpoint.model, "deepseek-v4-flash", "{base_url} {alias}");
+                assert_eq!(endpoint.model, "deepseek-flash", "{base_url} {alias}");
             }
         }
     }

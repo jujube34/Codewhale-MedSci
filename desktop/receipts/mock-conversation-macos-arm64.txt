@@ -1,0 +1,1 @@
+PASS: real sidecar streamed Chinese text through one mock provider request; no real API key or vendor calls

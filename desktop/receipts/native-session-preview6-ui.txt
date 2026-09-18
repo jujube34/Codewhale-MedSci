@@ -1,0 +1,2 @@
+Compiled frontend browser checks: background opacity=1, position=100% 50%, body color=rgb(212,231,238), conversation gradient=none. Running with empty draft: one Stop button. Running with nonempty draft: one Steer button. Clicking Steer delivered the exact draft, cleared it, and restored one Stop button. Native automation unavailable; browser fixture only.
+Idle empty draft: one disabled Stop button; idle nonempty draft: one enabled Send button.

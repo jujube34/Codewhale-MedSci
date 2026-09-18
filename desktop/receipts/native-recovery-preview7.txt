@@ -1,0 +1,7 @@
+running 3 tests
+test runtime_threads::tests::restart_rebuild_restores_tool_call_identity_from_persisted_items ... ok
+test runtime_threads::tests::restart_rebuild_skips_legacy_tool_items_without_identity ... ok
+test runtime_threads::tests::restart_rebuild_keeps_in_flight_tool_call_identity ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 12661 filtered out; finished in 0.25s
+

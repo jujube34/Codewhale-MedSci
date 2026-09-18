@@ -1,0 +1,2 @@
+PASS: actual compiled UI with isolated mock snapshot rendered reasoning and final response separately. Reasoning grew to 24 paragraphs; bottom scroll gap 0 px. Conversation background-image: none. Native GUI automation unavailable; browser verification only.
+PASS: offline real sidecar provider reasoning_content stream arrived before final response and remained distinct. No real API keys or vendor calls.

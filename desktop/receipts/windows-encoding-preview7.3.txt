@@ -1,0 +1,6 @@
+PASS: utf-8 subprocess output
+PASS: gbk subprocess output
+PASS: cp1252 subprocess output
+PASS: exact raw error bytes preserved with readable GBK message and exit code
+PASS: isolated Python subprocess forced to UTF-8
+5 checks passed; 0 failed

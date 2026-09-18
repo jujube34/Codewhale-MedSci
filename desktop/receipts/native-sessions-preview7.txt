@@ -1,0 +1,4 @@
+PASS: provider reasoning_content streams through real Runtime before final response; both remain distinct
+PASS: native session list/read/new/select; A -> B -> A restores actual model context, persists tool history, and isolates new sessions
+PASS: durable runtime history restored after process restart; context estimate available; cross-workspace session selection rejected; separate workspace gets a distinct session
+PASS: full access executed an out-of-workspace fixture write without an approval prompt; no real API key or vendor calls
