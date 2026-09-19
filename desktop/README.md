@@ -14,7 +14,7 @@
 - Windows 10/11 x64：使用当前用户安装器安装，无需管理员权限。安装时自动注册文件夹空白处和文件夹图标的“在 Codewhale-MedSci 中打开”，传入该目录作为工作目录；卸载自动清除。Windows 11 位于“显示更多选项”，一级 IExplorerCommand 尚未实现。首次安装 WebView2 可能需要联网。
 - 点击标题栏工作目录按钮、从菜单“文件 → 打开工作文件夹…”或按 Cmd/Ctrl+O 选择工作文件夹；从底栏“配置 API”保存自己的 DeepSeek 密钥，保存后测试连接。
 - 第一次发送前离线建立共享 Python 环境，也可从“工具 → 初始化离线办公环境”主动初始化。
-- 模型名右侧“会话”可查看当前目录的记录、新建或切换会话。列表和消息直接来自 Codewhale Runtime；切换正在执行的会话会先停止任务。
+- 模型名右侧“会话”可查看当前目录的记录、新建或切换会话。列表和浏览历史直接来自原生 SavedSession，不要求配置 API 密钥；开始执行时取得原生 Runtime 所有权，切换前停止并保存任务。
 - 底栏计费来自 Runtime 累计用量与价格收据；未知价格显示暂无数据，部分计费以 ≥ 标记。上下文是当前保留历史的估算，按 1024 tokens = 1K，每轮结束更新，鼠标悬停可查看口径。
 - Enter 发送，Shift+Enter 换行；Cmd/Ctrl+O 打开文件夹，Cmd/Ctrl+N 新建会话。
 - 公司登录明确返回“企业登录暂未启用”，不会保存公司密码或伪装登录。
@@ -34,8 +34,8 @@ CPU RapidOCR 与本地模型；两种旧 Flash ID 在官方路由迁移。
 - 网络目前仅直连，系统代理/PAC/手动代理及三类统一出口尚未实现。
 - Registry 在桌面配置中禁用。本地能力索引、缺失能力门禁和选择收据尚未实现。
 - 共享依赖首次初始化可用；完整的 Agent 安装申请、变更计划审批、pip 拦截、全平台只读保护尚未完成。不要把底层 manager CLI 当成对 Agent 开放的无审批安装接口。
-- preview.6 移除 GUI 自建会话 ID 和 SQLite 存储读写。所有会话以 Codewhale Runtime 的 thread ID 和持久化 items 为准，续接绑定同一原生 session。旧 GUI 数据库留在原处，不删除、不再读取；只有旧 GUI 文本而没有 Codewhale 持久历史的记录不冒充可续接 session。
-- 此构建主动使用 Full Access，不提供工作区沙箱隔离。
+- preview.6 移除 GUI 自建会话 ID 和 SQLite 存储读写。本次源码改为以原生 SavedSession ID 标识用户会话；Runtime thread ID 仅作为执行身份。旧 GUI 数据库留在原处，不删除、不再读取；只有旧 GUI 文本而没有 Codewhale 持久历史的记录不冒充可续接 session。
+- GUI 新建任务仍采用 Full Access；接续已有原生会话不再无条件覆盖其权限。应用和安装器本身不要求系统管理员权限。
 - 未做真实 DeepSeek 付费调用、完整多模态矩阵、50 轮稳定性及三个干净系统安装/卸载验收。
 - Finder 扩展授权、Windows 11 一级菜单、Developer ID、公证、Windows 代码签名、许可证审查待完成。
 - 日志滚动、脱敏诊断导出、全量本地化资源、可访问性焦点管理和菜单细节仍需补齐。
@@ -82,9 +82,9 @@ desktop/scripts/build-local.sh
 ## 多实例与共享数据
 
 - 新启动默认新会话，Agent 按需启动。标题含完整目录、会话 ID 和进程号；手动切换忙碌工作区仍需确认。
-- 运行配置和 WebView 缓存位于每实例临时目录；原生 Runtime 历史持久保存在 `Codewhale-MedSci/agent/tasks/desktop/`，关闭窗口不会删除。会话列表通过原生 Runtime 只读汇总，包含旧 `agent/tasks/runtime` 历史，未新增 GUI 会话数据库。
+- 运行配置和 WebView 缓存位于每实例临时目录；GUI 复用 Codewhale 的原生 home（包括显式 `CODEWHALE_HOME`）、SavedSession 和执行能力。用户无需使用 TUI。GUI 的私有配置和凭据不覆盖原生配置；旧 `agent/tasks/runtime`、`agent/tasks/desktop/` 保留原处，通过显式原生清点及导入入口处理，不混入日常列表。
 - 每个会话存储只有一个窗口可续接；被占用时返回提示，原窗口不受影响。旧版共享存储中的会话作为一个整体占用，保留原始数据及 Runtime 独占保护。
 - 全局设置采用跨进程锁及唯一临时文件原子替换；最后成功保存的配置成为新窗口默认值，其他窗口保留运行配置。系统密钥共享，其他窗口重启 Agent 后读取新凭据；删除凭据不会撤销已交给运行中进程的凭据。
 - 共享 Python 使用期间持有读锁，初始化/更新获取独占锁。其他窗口仍有 Agent 使用该环境时，更新会失败并保留现有环境；可关闭那些窗口后重试。
 - Windows 每个 Agent 树归属独立 Job Object，退出或崩溃仅回收本实例的子进程。同目录多个任务仍须避免同时改写同一文件或 Git 索引。
-- 本改动要求 GUI 与支持 `desktop_multi_instance` 的 sidecar 配套更新；旧 sidecar 会明确拒绝启动。无需修改右键注册命令。
+- 本改动要求 GUI 与支持 `native_session_interop` 的 sidecar 配套更新；旧 sidecar 会明确拒绝启动。右键菜单仅注册到当前用户 HKCU。原生能力复用的实现与验收见 `receipts/session-interop-windows-2026-09-19.md`，旧安装包不代表这些源码改动。2026-09-20 起按 Windows GUI 使用路径验收，GUI／TUI 往返不属于交付要求。

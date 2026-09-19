@@ -58,7 +58,7 @@ async fn runtime_store_binding_persists_on_exit_without_a_model_turn() -> anyhow
         .expect("attached Runtime store");
     app.runtime_services.task_manager = Some(tasks.clone());
     let (handle, actor) =
-        persistence_actor::spawn_persistence_actor(SessionManager::default_location()?);
+        persistence_actor::spawn_persistence_actor(SessionManager::default_location()?, None);
     // Match clean exit ordering: no Engine turn, checkpoint or snapshot has
     // been queued by this host before its TaskManager stops.
     tasks.shutdown_and_wait().await?;
@@ -118,7 +118,7 @@ async fn runtime_store_binding_exit_preserves_inflight_recovery() -> anyhow::Res
         app.is_loading = loading;
         app.dispatch_in_flight = dispatch;
         let (handle, actor) =
-            persistence_actor::spawn_persistence_actor(SessionManager::default_location()?);
+            persistence_actor::spawn_persistence_actor(SessionManager::default_location()?, None);
         assert!(
             !super::super::event_loop::persist_settled_session_on_shutdown(&mut app, &handle)
                 .map_err(anyhow::Error::msg)?

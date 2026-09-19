@@ -1507,6 +1507,35 @@ impl TaskManager {
             .map(|runtime| runtime.session_store_binding())
     }
 
+    pub(crate) fn load_owned_session(
+        &self,
+        id: &str,
+    ) -> Result<crate::session_manager::SavedSession> {
+        let runtime = self
+            .runtime_threads
+            .as_ref()
+            .context("Task manager has no Runtime owner")?;
+        let session = runtime.load_owned_session(
+            &crate::session_manager::SessionManager::default_location()?,
+            id,
+        )?;
+        runtime.require_saved_runtime_boundary(&session)?;
+        Ok(session)
+    }
+
+    pub(crate) async fn save_session_snapshot(
+        &self,
+        sessions: &crate::session_manager::SessionManager,
+        session: &crate::session_manager::SavedSession,
+    ) -> Result<()> {
+        let runtime = self
+            .runtime_threads
+            .as_ref()
+            .context("Task manager has no Runtime owner")?;
+        let _admission = runtime.session_checkpoint_guard().await;
+        runtime.save_session_snapshot(sessions, session, None).await
+    }
+
     pub async fn set_default_workspace(&self, workspace: PathBuf) {
         let mut default_workspace = self.default_workspace.lock().await;
         *default_workspace = workspace;

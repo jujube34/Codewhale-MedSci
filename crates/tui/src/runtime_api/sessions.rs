@@ -8,8 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::runtime_threads::{
-    CreateThreadRequest, RuntimeTurnStatus, ThreadDetail, ThreadListFilter, TurnItemKind,
-    TurnItemLifecycleStatus,
+    CreateThreadRequest, RuntimeTurnStatus, ThreadDetail, ThreadListFilter, TurnItemLifecycleStatus,
 };
 use crate::session_manager::{
     SavedSession, SessionListFilter, SessionManager, SessionMetadata, SessionMutator,
@@ -17,7 +16,6 @@ use crate::session_manager::{
 };
 use crate::session_peek::{MAX_PEEK_ENTRIES, SessionPeek, build_peek};
 use crate::session_projection::{SessionQuery, SessionSortMode, SessionSummary, project_sessions};
-use codewhale_models::{ContentBlock, Message};
 
 use super::{ApiError, RuntimeApiState, map_thread_err, truncate_text};
 use codewhale_models::Role;
@@ -310,6 +308,73 @@ pub(super) async fn resume_session_thread(
         })?;
     }
 
+    let session = state
+        .runtime_threads
+        .load_owned_session(&manager, &id)
+        .map_err(|error| ApiError {
+            status: StatusCode::CONFLICT,
+            message: error.to_string(),
+        })?;
+    let linked: Vec<_> = state
+        .runtime_threads
+        .list_threads(ThreadListFilter::IncludeArchived, None)
+        .await
+        .map_err(map_thread_err)?
+        .into_iter()
+        .filter(|thread| thread.session_id.as_deref() == Some(&id) && thread.task_id.is_none())
+        .collect();
+    if linked.len() > 1 {
+        return Err(ApiError { status: StatusCode::CONFLICT,
+            message: "Multiple Runtime threads claim this saved session; resolve their histories before continuing".into() });
+    }
+    if let Some(thread) = linked.first() {
+        let detail = state
+            .runtime_threads
+            .get_thread_detail(&thread.id)
+            .await
+            .map_err(map_thread_err)?;
+        if thread_detail_has_live_work(&detail)
+            || state
+                .runtime_threads
+                .thread_has_active_turn(&thread.id)
+                .await
+        {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: "Session is executing; wait for its owner to save and release it".into(),
+            });
+        }
+        if req
+            .model
+            .as_ref()
+            .is_some_and(|model| model != &thread.model)
+            || req.mode.as_ref().is_some_and(|mode| mode != &thread.mode)
+        {
+            return Err(ApiError::bad_request(
+                "Change the resumed thread's model or mode explicitly after resuming",
+            ));
+        }
+        // Loading uses the verified native prefix plus uncovered Runtime turns.
+        // Never re-seed them or allocate a second thread on each host switch.
+        state
+            .runtime_threads
+            .get_engine(&thread.id)
+            .await
+            .map_err(|error| ApiError {
+                status: StatusCode::CONFLICT,
+                message: error.to_string(),
+            })?;
+        return Ok((
+            StatusCode::OK,
+            Json(ResumeSessionResponse {
+                thread_id: thread.id.clone(),
+                session_id: id,
+                message_count: session.messages.len(),
+                summary: "Resumed the existing native session".into(),
+            }),
+        ));
+    }
+
     let model = req.model.unwrap_or_else(|| session.metadata.model.clone());
     let mode = req.mode.unwrap_or_else(|| {
         session
@@ -389,7 +454,12 @@ pub(super) async fn create_session_from_thread(
         .await
         .map_err(map_thread_err)?;
 
-    if thread_detail_has_live_work(&detail) {
+    if thread_detail_has_live_work(&detail)
+        || state
+            .runtime_threads
+            .thread_has_active_turn(thread_id)
+            .await
+    {
         return Err(ApiError {
             status: StatusCode::CONFLICT,
             message: format!(
@@ -398,7 +468,10 @@ pub(super) async fn create_session_from_thread(
         });
     }
 
-    let messages = messages_from_thread_detail(&detail);
+    let messages = state
+        .runtime_threads
+        .restore_thread_messages(&detail.thread)
+        .map_err(|error| ApiError::internal(format!("Native history recovery failed: {error}")))?;
     if messages.is_empty() {
         return Err(ApiError::bad_request(format!(
             "Thread {thread_id} has no user or assistant messages to save"
@@ -407,14 +480,53 @@ pub(super) async fn create_session_from_thread(
 
     let manager = SessionManager::new(state.sessions_dir.clone())
         .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
-    let total_tokens = total_tokens_from_thread_detail(&detail);
-    let session_handle = uuid::Uuid::new_v4().to_string();
+
+    // Deterministic native provenance closes the crash window between saving
+    // the snapshot and recording its checkpoint, without a migration database.
+    use sha2::{Digest, Sha256};
+    let binding = state.runtime_threads.session_store_binding();
+    let source = format!("{}:{thread_id}", binding.execution_scope);
+    let session_handle = detail.thread.session_id.clone().unwrap_or_else(|| {
+        format!(
+            "import-{}",
+            Sha256::digest(source.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        )
+    });
+    match manager.load_session(&session_handle) {
+        Ok(existing) => {
+            if existing.messages != messages
+                || existing.metadata.runtime_store.as_ref() != Some(&binding)
+            {
+                return Err(ApiError { status: StatusCode::CONFLICT,
+                    message: "The import already has a saved history that differs; preserve both records and resolve the conflict".into() });
+            }
+            state
+                .runtime_threads
+                .set_thread_session_checkpoint(thread_id, &existing)
+                .await
+                .map_err(map_thread_err)?;
+            return Ok((
+                StatusCode::OK,
+                Json(CreateSessionResponse {
+                    session_id: session_handle,
+                    thread_id: thread_id.into(),
+                    message_count: existing.messages.len(),
+                    title: existing.metadata.title,
+                }),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(map_session_err(&session_handle, error, "read")),
+    }
     let mut session = create_saved_session_with_id_and_mode(
         session_handle.clone(),
         &messages,
         &detail.thread.model,
         &detail.thread.workspace,
-        total_tokens,
+        0,
         None,
         Some(&detail.thread.mode),
     );
@@ -429,30 +541,28 @@ pub(super) async fn create_session_from_thread(
         )?;
     }
     session.system_prompt = detail.thread.system_prompt.clone();
+    session
+        .bind_runtime_store(binding)
+        .map_err(ApiError::internal)?;
 
     if let Some(title) =
         session_title_override(req.title.as_deref(), detail.thread.title.as_deref())
     {
         session.metadata.title = title;
     }
+    session.metadata.cost.coverage_recorded = true;
     let title = session.metadata.title.clone();
     let message_count = session.metadata.message_count;
 
     persist_thread_cost(&state, thread_id, &mut session).await?;
 
-    manager
-        .save_session(&session)
-        .map_err(|e| ApiError::internal(format!("Failed to save session: {e}")))?;
-
-    // Link the session to the thread so that `ensure_engine_loaded` can
-    // restore the full message history from the session file.
     state
         .runtime_threads
-        .set_thread_session_checkpoint(&detail.thread.id, &session)
+        .save_session_snapshot(&manager, &session, Some(&detail.thread.id))
         .await
         .map_err(|e| {
             ApiError::internal(format!(
-                "Session was saved but its Runtime checkpoint could not be bound: {e}"
+                "Native session import publication failed; recovery records were preserved: {e}"
             ))
         })?;
 
@@ -521,148 +631,6 @@ fn thread_detail_has_live_work(detail: &ThreadDetail) -> bool {
     })
 }
 
-pub(super) fn messages_from_thread_detail(detail: &ThreadDetail) -> Vec<Message> {
-    let items_by_id: HashMap<&str, _> = detail
-        .items
-        .iter()
-        .map(|item| (item.id.as_str(), item))
-        .collect();
-    let mut messages = Vec::new();
-
-    for turn in &detail.turns {
-        let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
-        let mut user_blocks: Vec<ContentBlock> = Vec::new();
-        let flush_assistant = |blocks: &mut Vec<ContentBlock>, msgs: &mut Vec<Message>| {
-            if !blocks.is_empty() {
-                msgs.push(Message {
-                    role: Role::Assistant,
-                    content: std::mem::take(blocks),
-                });
-            }
-        };
-        let flush_user = |blocks: &mut Vec<ContentBlock>, msgs: &mut Vec<Message>| {
-            if !blocks.is_empty() {
-                msgs.push(Message {
-                    role: Role::User,
-                    content: std::mem::take(blocks),
-                });
-            }
-        };
-
-        for item_id in &turn.item_ids {
-            let Some(item) = items_by_id.get(item_id.as_str()) else {
-                continue;
-            };
-            match item.kind {
-                TurnItemKind::UserMessage => {
-                    flush_assistant(&mut assistant_blocks, &mut messages);
-
-                    let text = item.detail.as_deref().map(str::trim).unwrap_or("");
-                    if !text.is_empty() {
-                        user_blocks.push(ContentBlock::Text {
-                            text: text.to_string(),
-                            cache_control: None,
-                        });
-                    }
-                }
-                TurnItemKind::AgentMessage => {
-                    flush_user(&mut user_blocks, &mut messages);
-                    let text = item.detail.as_deref().map(str::trim).unwrap_or("");
-                    if !text.is_empty() {
-                        assistant_blocks.push(ContentBlock::Text {
-                            text: text.to_string(),
-                            cache_control: None,
-                        });
-                    }
-                }
-                TurnItemKind::AgentReasoning => {
-                    flush_user(&mut user_blocks, &mut messages);
-                    let thinking = item.detail.as_deref().map(str::trim).unwrap_or("");
-                    if !thinking.is_empty() {
-                        assistant_blocks.push(ContentBlock::Thinking {
-                            thinking: thinking.to_string(),
-                            signature: None,
-                            state: None,
-                        });
-                    }
-                }
-                TurnItemKind::ToolCall => {
-                    // Check metadata to distinguish tool_use from tool_result.
-                    let meta = item.metadata.as_ref();
-                    let is_tool_result = meta.and_then(|m| m.get("tool_result_for")).is_some();
-                    if is_tool_result {
-                        flush_assistant(&mut assistant_blocks, &mut messages);
-
-                        let tool_use_id = meta
-                            .and_then(|m| m.get("tool_result_for"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let content = item.detail.as_deref().unwrap_or("").to_string();
-                        let is_error = meta
-                            .and_then(|m| m.get("is_error"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let content_blocks = meta
-                            .and_then(|m| m.get("content_blocks"))
-                            .and_then(|v| v.as_array())
-                            .cloned();
-                        user_blocks.push(ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            is_error: if is_error { Some(true) } else { None },
-                            content_blocks,
-                        });
-                    } else {
-                        flush_user(&mut user_blocks, &mut messages);
-                        let tool_use_id = meta
-                            .and_then(|m| m.get("tool_use_id"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let tool_name = meta
-                            .and_then(|m| m.get("tool_name"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let input_str = item.detail.as_deref().unwrap_or("{}");
-                        let input: Value = serde_json::from_str(input_str).unwrap_or(Value::Null);
-                        assistant_blocks.push(ContentBlock::ToolUse {
-                            id: tool_use_id,
-                            name: tool_name,
-                            input,
-                            caller: None,
-                            thought_signature: None,
-                        });
-                    }
-                }
-                // Skip other item kinds (file_change, command_execution, etc.)
-                _ => {}
-            }
-        }
-        flush_assistant(&mut assistant_blocks, &mut messages);
-        flush_user(&mut user_blocks, &mut messages);
-    }
-
-    messages
-}
-
-/// Merge the thread's authoritative cost into a session about to be saved.
-///
-/// The engine snapshot carries messages/tokens but no cost — cost lives in
-/// the turn records' route-audited usage — so derive it from the same
-/// accumulation that powers `/v1/usage` (recorded-time pricing, both
-/// published currencies). The parent/child split mirrors the TUI writer's
-/// field semantics (`sync_cost_to_metadata`): `session_cost_*` carries
-/// parent-turn spend and `subagent_cost_*` routed-child spend, so a session
-/// previously saved by the TUI never gets child spend counted twice in
-/// `total_estimate()`. Merging each side with max keeps a session resumed
-/// across threads from losing previously persisted spend, and extends the
-/// monotonic display guarantee (#244) to the persisted shape. Coverage
-/// travels with the money it qualifies (#4318): the counters are
-/// parent-turn coverage (the TUI's own session-level accounting), CNY
-/// included, and `coverage_recorded` marks that this writer computed them
-/// from audited turn records rather than deserializing a legacy default.
 async fn persist_thread_cost(
     state: &RuntimeApiState,
     thread_id: &str,
@@ -713,7 +681,12 @@ async fn persist_thread_cost(
         .extend(usage.parent.live_pricing_unusable_defects.iter().cloned());
     cost.route_receipts
         .extend(usage.parent.route_receipts.iter().cloned());
-    cost.coverage_recorded = true;
+    // Native Runtime contains this GUI session's cumulative receipts across restarts.
+    // Preserve legacy unknown coverage; a save cannot reconstruct missing receipts.
+    session.metadata.total_tokens = session
+        .metadata
+        .total_tokens
+        .max(combined.input_tokens.saturating_add(combined.output_tokens));
     Ok(())
 }
 
@@ -724,7 +697,7 @@ async fn persist_thread_cost(
 /// token counts and message ordering are authoritative.
 pub(super) async fn save_current_session(
     State(state): State<RuntimeApiState>,
-    Json(req): Json<SaveSessionRequest>,
+    Json(mut req): Json<SaveSessionRequest>,
 ) -> Result<Json<SaveSessionResponse>, ApiError> {
     let _checkpoint_admission = state.runtime_threads.session_checkpoint_guard().await;
     // Find the thread to save.
@@ -744,6 +717,38 @@ pub(super) async fn save_current_session(
                 .ok_or_else(|| ApiError::bad_request("No threads to save"))?
         }
     };
+
+    let detail = state
+        .runtime_threads
+        .get_thread_detail(&thread_id)
+        .await
+        .map_err(map_thread_err)?;
+    if thread_detail_has_live_work(&detail)
+        || state
+            .runtime_threads
+            .thread_has_active_turn(&thread_id)
+            .await
+    {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: format!(
+                "Thread {thread_id} has queued or active work; wait for a stable snapshot"
+            ),
+        });
+    }
+    if let Some(linked_id) = detail.thread.session_id.as_ref() {
+        if req
+            .session_id
+            .as_ref()
+            .is_some_and(|requested| requested != linked_id)
+        {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: "A linked thread must save its existing session; use an explicit fork to create another session".into(),
+            });
+        }
+        req.session_id = Some(linked_id.clone());
+    }
 
     // Get the engine handle (loads the thread into an engine if needed),
     // then request a session snapshot. This reuses the same code path as
@@ -770,10 +775,18 @@ pub(super) async fn save_current_session(
     let mut session = if let Some(ref existing_id) = req.session_id {
         match manager.load_session(existing_id) {
             Ok(existing) => {
+                if detail.thread.session_id.as_deref() != Some(existing_id.as_str()) {
+                    return Err(ApiError {
+                        status: StatusCode::CONFLICT,
+                        message: "Resume the existing native session before saving to its id"
+                            .into(),
+                    });
+                }
+                let total_tokens = existing.metadata.total_tokens;
                 let mut updated = crate::session_manager::update_session(
                     existing,
                     &snapshot.messages,
-                    snapshot.total_tokens,
+                    total_tokens,
                     snapshot.system_prompt.as_ref(),
                 );
                 updated.metadata.model = snapshot.model.clone();
@@ -791,10 +804,11 @@ pub(super) async fn save_current_session(
                         &snapshot.messages,
                         &snapshot.model,
                         &snapshot.workspace,
-                        snapshot.total_tokens,
+                        0,
                         snapshot.system_prompt.as_ref(),
                         Some(snapshot.mode.as_str()),
                     );
+                    session.metadata.cost.coverage_recorded = true;
                     session.metadata.set_model_provider_route(
                         &snapshot.model_provider,
                         snapshot.model_provider_id.as_deref(),
@@ -812,10 +826,11 @@ pub(super) async fn save_current_session(
             &snapshot.messages,
             &snapshot.model,
             &snapshot.workspace,
-            snapshot.total_tokens,
+            0,
             snapshot.system_prompt.as_ref(),
             Some(snapshot.mode.as_str()),
         );
+        session.metadata.cost.coverage_recorded = true;
         session.metadata.set_model_provider_route(
             &snapshot.model_provider,
             snapshot.model_provider_id.as_deref(),
@@ -823,24 +838,24 @@ pub(super) async fn save_current_session(
         session
     };
 
+    manager.merge_persisted_lifecycle(&mut session.metadata);
+    session.work_state = snapshot.work_state.map_err(ApiError::internal)?;
+    session
+        .bind_runtime_store(state.runtime_threads.session_store_binding())
+        .map_err(|message| ApiError {
+            status: StatusCode::CONFLICT,
+            message,
+        })?;
     persist_thread_cost(&state, &thread_id, &mut session).await?;
 
-    // Save the session.
-    manager
-        .save_session(&session)
-        .map_err(|e| ApiError::internal(format!("Failed to save session: {e}")))?;
-
-    // Link the session to the thread so that `ensure_engine_loaded` can
-    // restore the full message history (including thinking/tool blocks)
-    // from the session file instead of reconstructing from turns.
     let session_handle = session.metadata.id.clone();
     state
         .runtime_threads
-        .set_thread_session_checkpoint(&thread_id, &session)
+        .save_session_snapshot(&manager, &session, Some(&thread_id))
         .await
         .map_err(|e| {
             ApiError::internal(format!(
-                "Session was saved but its Runtime checkpoint could not be bound: {e}"
+                "Native session publication failed; recovery records were preserved: {e}"
             ))
         })?;
 
@@ -848,15 +863,6 @@ pub(super) async fn save_current_session(
         session_id: session_handle,
         session: session_to_detail(session),
     }))
-}
-
-fn total_tokens_from_thread_detail(detail: &ThreadDetail) -> u64 {
-    detail
-        .turns
-        .iter()
-        .filter_map(|turn| turn.usage.as_ref())
-        .map(|usage| u64::from(usage.input_tokens) + u64::from(usage.output_tokens))
-        .sum()
 }
 
 fn session_title_override(requested: Option<&str>, thread_title: Option<&str>) -> Option<String> {
@@ -949,12 +955,13 @@ pub(super) fn session_to_detail(session: SavedSession) -> SessionDetailResponse 
                     } => {
                         json!({ "type": "tool_result", "tool_use_id": tool_use_id, "content": content })
                     }
-                    codewhale_models::ContentBlock::ImageUrl { .. } => Value::Null,
+                    codewhale_models::ContentBlock::ImageUrl { .. } => json!(block),
                 })
                 .collect();
             json!({
                 "role": msg.role,
                 "content": content_blocks,
+                "display_user_prompt": crate::runtime_handoff::display_user_prompt(msg),
             })
         })
         .collect();

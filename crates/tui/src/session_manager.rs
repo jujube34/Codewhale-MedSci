@@ -873,6 +873,16 @@ impl SessionWorkState {
     }
 }
 
+impl From<crate::work_graph::WorkRuntimeSnapshot> for SessionWorkState {
+    fn from(state: crate::work_graph::WorkRuntimeSnapshot) -> Self {
+        Self {
+            graph: Some(state.graph),
+            todos: state.todos,
+            plan: state.plan,
+        }
+    }
+}
+
 /// Latest concrete Auto route and the decision receipt that produced it.
 ///
 /// This is additive, optional session metadata: sessions written before
@@ -935,6 +945,23 @@ pub struct SavedSession {
     pub(crate) last_auto_route: Option<SavedAutoRouteReceipt>,
 }
 impl SavedSession {
+    /// Retain the native store owner when either host builds a new snapshot.
+    /// A missing store can be recovered, but a live foreign owner cannot be replaced.
+    pub(crate) fn bind_runtime_store(
+        &mut self,
+        binding: crate::runtime_threads::RuntimeStoreBinding,
+    ) -> Result<(), String> {
+        if self.metadata.runtime_store.as_ref().is_some_and(|saved| {
+            saved != &binding && !saved.is_missing_session_store().unwrap_or(false)
+        }) {
+            return Err(
+                "session snapshot refused to replace its saved Runtime store ownership".into(),
+            );
+        }
+        self.metadata.runtime_store = Some(binding);
+        Ok(())
+    }
+
     /// Drop the journal-derived compatibility projection before an async
     /// persistence request takes ownership. Disk serialization restores it.
     pub(crate) fn compact_for_persistence_queue(&mut self) {
@@ -943,7 +970,7 @@ impl SavedSession {
         }
     }
 
-    fn storage_compatible_copy(&self) -> Option<Self> {
+    pub(crate) fn storage_compatible_copy(&self) -> Option<Self> {
         let journal = self.journal.as_ref()?;
         let active_messages = journal.to_messages();
         if !self.messages.is_empty() && self.messages == active_messages {

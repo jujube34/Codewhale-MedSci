@@ -5866,13 +5866,7 @@ impl App {
         if let Some(work) = self.runtime_services.work.as_ref() {
             return work
                 .capture(self.current_session_id.as_deref())
-                .map(|state| {
-                    state.map(|state| SessionWorkState {
-                        graph: Some(state.graph),
-                        todos: state.todos,
-                        plan: state.plan,
-                    })
-                });
+                .map(|state| state.map(Into::into));
         }
         let todos = Self::retry_lock(&self.todos, 100)
             .ok_or_else(|| "To-do state is busy; try saving again".to_string())?;
@@ -5893,13 +5887,7 @@ impl App {
         if let Some(work) = self.runtime_services.work.as_ref() {
             let state = work
                 .try_capture(self.current_session_id.as_deref())
-                .map(|state| {
-                    state.map(|state| SessionWorkState {
-                        graph: Some(state.graph),
-                        todos: state.todos,
-                        plan: state.plan,
-                    })
-                })?;
+                .map(|state| state.map(Into::into))?;
             self.last_known_work_state = Some(state.clone());
             return Ok(state);
         }

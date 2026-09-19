@@ -70,11 +70,6 @@ struct Inner {
     generation: u64,
     stop_requested: bool,
     credentials_changed: bool,
-    runtime: Option<RuntimeScope>,
-}
-struct RuntimeScope {
-    path: PathBuf,
-    _lease: File,
 }
 struct Desktop {
     inner: Arc<Mutex<Inner>>,
@@ -105,48 +100,6 @@ fn open_lock(path: &Path) -> Result<File, String> {
         .truncate(false)
         .open(path)
         .map_err(|e| e.to_string())
-}
-fn claim_runtime(home: &Path, id: &str) -> Result<RuntimeScope, String> {
-    if id.is_empty()
-        || !id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        return Err("无效会话 ID".into());
-    }
-    let tasks = home.join("agent/tasks");
-    let parent = if id == "legacy" {
-        tasks.clone()
-    } else {
-        tasks.join("desktop")
-    };
-    let path = parent
-        .join(if id == "legacy" { "runtime" } else { id })
-        .canonicalize()
-        .map_err(|_| "会话存储不存在".to_string())?;
-    if !path.starts_with(parent.canonicalize().map_err(|e| e.to_string())?) {
-        return Err("会话存储路径无效".into());
-    }
-    let file = open_lock(&path.join("desktop-owner.lock"))?;
-    file.try_lock()
-        .map_err(|_| "此会话已在另一个窗口打开，请先在该窗口切换会话或关闭窗口".to_string())?;
-    Ok(RuntimeScope { path, _lease: file })
-}
-fn new_runtime(home: &Path) -> Result<RuntimeScope, String> {
-    let root = home.join("agent/tasks/desktop");
-    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-    // Persistent native history, deliberately separate from instance scratch.
-    let path = tempfile::Builder::new()
-        .prefix("session-")
-        .tempdir_in(root)
-        .map_err(|e| e.to_string())?
-        .keep();
-    claim_runtime(
-        home,
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .ok_or("会话路径无效")?,
-    )
 }
 fn save_settings(home: &Path, settings: &Settings) -> Result<(), String> {
     let lock = open_lock(&home.join("settings.lock"))?;
@@ -514,6 +467,73 @@ fn reasoning_event(messages: &mut Vec<Message>, sequence: u64, event: &Value) ->
     }
     true
 }
+fn apply_saved_session(view: &mut Snapshot, saved: &Value) -> Result<(), String> {
+    let id = saved["metadata"]["id"]
+        .as_str()
+        .ok_or("原生快照缺少会话 ID")?;
+    let messages = saved["messages"].as_array().ok_or("原生快照缺少消息")?;
+    if messages
+        .iter()
+        .any(|message| message["role"] == "user" && message.get("display_user_prompt").is_none())
+    {
+        return Err("会话展示协议不兼容，请更新配套 Agent 后重试".into());
+    }
+    view.session_id = id.into();
+    view.messages.clear();
+    view.cards.clear();
+    view.metrics = Value::Null;
+    let mut sequence = 0;
+    for message in messages {
+        let user = message["role"] == "user";
+        if let Some(prompt) = message["display_user_prompt"]
+            .as_str()
+            .filter(|text| !text.trim().is_empty())
+        {
+            sequence += 1;
+            view.messages.push(Message {
+                sequence,
+                role: "user".into(),
+                text: prompt.into(),
+                streaming: false,
+                duration_ms: None,
+            });
+        }
+        for block in message["content"].as_array().into_iter().flatten() {
+            sequence += 1;
+            let kind = block["type"].as_str().unwrap_or("");
+            if user && kind == "text" {
+                continue;
+            }
+            if matches!(kind, "text" | "thinking") {
+                view.messages.push(Message {
+                    sequence,
+                    role: if kind == "thinking" {
+                        "reasoning".into()
+                    } else {
+                        message["role"].as_str().unwrap_or("assistant").into()
+                    },
+                    text: block[if kind == "thinking" {
+                        "thinking"
+                    } else {
+                        "text"
+                    }]
+                    .as_str()
+                    .or_else(|| block["text"].as_str())
+                    .unwrap_or("")
+                    .into(),
+                    streaming: false,
+                    duration_ms: None,
+                });
+            } else {
+                let item = json!({"id":format!("saved-{sequence}"),"kind":"tool_call","status":"completed",
+                    "summary":block["name"].as_str().unwrap_or(kind),"detail":serde_json::to_string_pretty(block).unwrap_or_default(),
+                    "metadata":{"tool_use_id":block["tool_use_id"].as_str().or(block["id"].as_str()),"tool_name":block["name"],"saved_block":block}});
+                view.cards.push(json!({"sequence":sequence,"event":"item.completed","item_id":item["id"],"payload":{"item":item}}));
+            }
+        }
+    }
+    Ok(())
+}
 // This is a transient rendering projection, never a second session store.
 fn apply_session(view: &mut Snapshot, session: &Value) -> Result<(), String> {
     let id = session["detail"]["thread"]["id"]
@@ -522,57 +542,12 @@ fn apply_session(view: &mut Snapshot, session: &Value) -> Result<(), String> {
     if session["runtime_id"] != id {
         return Err("Codewhale 会话 ID 不一致".into());
     }
-    view.session_id = id.into();
-    view.metrics = session["usage"].clone();
-    view.messages.clear();
-    view.cards.clear();
-    for (index, item) in session["detail"]["items"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let sequence = index as u64 + 1;
-        let role = match item["kind"].as_str().unwrap_or("") {
-            "user_message" => Some("user"),
-            "agent_message" => Some("assistant"),
-            "agent_reasoning" => Some("reasoning"),
-            _ => None,
-        };
-        if let Some(role) = role {
-            view.messages.push(Message {
-                sequence,
-                role: role.into(),
-                text: item["detail"]
-                    .as_str()
-                    .or(item["summary"].as_str())
-                    .unwrap_or("")
-                    .into(),
-                streaming: item["status"] == "in_progress",
-                duration_ms: item_duration_ms(item),
-            });
-        } else if matches!(
-            item["kind"].as_str(),
-            Some(
-                "tool_call"
-                    | "command_execution"
-                    | "file_change"
-                    | "context_compaction"
-                    | "status"
-                    | "error"
-            )
-        ) {
-            let event = match item["status"].as_str().unwrap_or("") {
-                "failed" => "item.failed",
-                "interrupted" | "canceled" => "item.interrupted",
-                "in_progress" | "queued" => "item.started",
-                _ => "item.completed",
-            };
-            view.cards.push(
-                json!({"sequence":sequence,"event":event,"item_id":item["id"],"payload":{"item":item}}),
-            );
-        }
+    let saved = &session["saved"];
+    if saved["metadata"]["id"] != session["session_id"] {
+        return Err("原生会话展示快照不一致，请更新配套 Agent".into());
     }
+    apply_saved_session(view, saved)?;
+    view.metrics = session["usage"].clone();
     Ok(())
 }
 #[tauri::command]
@@ -580,58 +555,68 @@ async fn conversations(state: State<'_, Desktop>) -> Result<Value, String> {
     let _transition = state.begin_transition()?;
     list_conversations(&state).await
 }
+fn sidecar_binary(state: &Desktop) -> PathBuf {
+    state.resources.join(if cfg!(windows) {
+        "codewhale.exe"
+    } else {
+        "codewhale"
+    })
+}
 async fn list_conversations(state: &Desktop) -> Result<Value, String> {
-    let (a, thread, _) = ensure_agent(state).await?;
-    a.request(
-        "desktop/session",
-        json!({"thread_id":thread,"operation":"list"}),
+    let workspace = state
+        .inner
+        .lock()
+        .await
+        .view
+        .workspace
+        .clone()
+        .ok_or("请先选择工作文件夹")?;
+    Agent::native_session(&sidecar_binary(state), Path::new(&workspace), "list", None).await
+}
+async fn read_conversation(state: &Desktop, id: &str) -> Result<Value, String> {
+    let workspace = state
+        .inner
+        .lock()
+        .await
+        .view
+        .workspace
+        .clone()
+        .ok_or("请先选择工作文件夹")?;
+    let records =
+        Agent::native_session(&sidecar_binary(state), Path::new(&workspace), "list", None).await?;
+    if !records
+        .as_array()
+        .is_some_and(|rows| rows.iter().any(|row| row["id"] == id))
+    {
+        return Err("此工作目录中找不到该会话".into());
+    }
+    Agent::native_session(
+        &sidecar_binary(state),
+        Path::new(&workspace),
+        "read",
+        Some(id),
     )
     .await
 }
 #[tauri::command]
-async fn select_conversation(
-    state: State<'_, Desktop>,
-    id: String,
-    store: String,
-) -> Result<(), String> {
+async fn preview_conversation(state: State<'_, Desktop>, id: String) -> Result<Value, String> {
+    // Read-only projection: never acquire a Runtime lease or stop the active turn.
+    let saved = read_conversation(&state, &id).await?;
+    let mut preview = state.inner.lock().await.view.clone();
+    apply_saved_session(&mut preview, &saved)?;
+    Ok(json!({"metadata":saved["metadata"],"messages":preview.messages,"cards":preview.cards}))
+}
+#[tauri::command]
+async fn select_conversation(state: State<'_, Desktop>, id: String) -> Result<(), String> {
     let _transition = state.begin_transition()?;
     if state.inner.lock().await.view.session_id == id {
         return Ok(());
     }
-    // Only native history entries for this workspace may select a store.
-    let records = list_conversations(&state).await?;
-    if !records
-        .as_array()
-        .is_some_and(|rows| rows.iter().any(|r| r["id"] == id && r["store"] == store))
-    {
-        return Err("此工作目录中找不到该会话".into());
-    }
-    let same_store = state.inner.lock().await.runtime.as_ref().is_some_and(|r| {
-        r.path.file_name().and_then(|n| n.to_str())
-            == Some(if store == "legacy" { "runtime" } else { &store })
-    });
-    // Claim before stopping this window's task or mutating Runtime metadata.
-    let target = if same_store {
-        None
-    } else {
-        Some(claim_runtime(&state.home, &store)?)
-    };
+    let saved = read_conversation(&state, &id).await?;
     stop_internal(&state).await?;
-    let (previous_view, previous_runtime) = {
-        let mut i = state.inner.lock().await;
-        let previous_view = i.view.clone();
-        let previous_runtime = target.map(|scope| i.runtime.replace(scope));
-        i.view.session_id = id;
-        (previous_view, previous_runtime)
-    };
-    if let Err(error) = ensure_agent(&state).await {
-        let mut i = state.inner.lock().await;
-        i.view = previous_view;
-        if let Some(previous) = previous_runtime {
-            i.runtime = previous;
-        }
-        return Err(error);
-    }
+    let mut i = state.inner.lock().await;
+    apply_saved_session(&mut i.view, &saved)?;
+    i.view.status = "浏览已保存历史".into();
     Ok(())
 }
 #[tauri::command]
@@ -668,13 +653,12 @@ async fn switch_workspace_inner(state: &Desktop, path: String) -> Result<(), Str
         i.view.pending_workspace = Some(path);
         return Ok(());
     }
-    if let Some(a) = i.agent.take() {
-        a.kill().await
-    }
+    drop(i);
+    stop_internal(state).await?;
+    let mut i = state.inner.lock().await;
     i.generation += 1;
     i.thread = None;
     i.view.session_id.clear();
-    i.runtime = None;
     i.view.messages.clear();
     i.view.cards.clear();
     i.view.metrics = Value::Null;
@@ -908,9 +892,14 @@ async fn ensure_agent(state: &Desktop) -> Result<(Arc<Agent>, String, u64), Stri
     let s = i.view.settings.clone();
     let secret = key(&s.provider)?;
     let config = state.instance.path().join("agent.toml");
-    if i.runtime.is_none() {
-        i.runtime = Some(new_runtime(&state.home)?);
-    }
+    let new_session = i.view.session_id.is_empty();
+    let native_id = if new_session {
+        Agent::native_session(&sidecar_binary(state), Path::new(&path), "allocate", None).await?["id"]
+            .as_str().ok_or("原生服务未分配会话 ID")?.to_string()
+    } else {
+        i.view.session_id.clone()
+    };
+    let native_home = codewhale_config::codewhale_home().map_err(|e| e.to_string())?;
     // Serialize strings as JSON: these quoted strings are also valid TOML basic strings.
     let cfg = format!(
         "provider = {}\nmodel = {}\nbase_url = {}\nreasoning_effort = {}\napproval_policy = \"auto\"\nsandbox_mode = \"danger-full-access\"\nsandbox_network_access = true\ntelemetry = false\nlocale = \"zh-Hans\"\n[features]\nmcp = false\n",
@@ -941,7 +930,7 @@ async fn ensure_agent(state: &Desktop) -> Result<(Arc<Agent>, String, u64), Stri
     let (a, mut events) = Agent::start(
         &binary,
         Path::new(&path),
-        &state.home.join("agent"),
+        &native_home,
         &config,
         &secret,
         ProviderKind::parse(&s.provider)
@@ -950,7 +939,7 @@ async fn ensure_agent(state: &Desktop) -> Result<(Arc<Agent>, String, u64), Stri
             .env_vars()[0],
         shared.is_dir().then_some(shared.as_path()),
         python_lease,
-        &i.runtime.as_ref().ok_or("会话存储未初始化")?.path,
+        &native_id,
     )
     .await?;
     let health = tokio::time::timeout(Duration::from_secs(20), a.request("healthz", json!({})))
@@ -961,7 +950,7 @@ async fn ensure_agent(state: &Desktop) -> Result<(Arc<Agent>, String, u64), Stri
         return Err("Agent 版本不兼容，需要 0.9.13".into());
     }
     let caps = a.request("capabilities", json!({})).await?;
-    if caps["desktop_multi_instance"] != true {
+    if caps["native_session_interop"] != true {
         a.kill().await;
         return Err("Agent 不支持独立会话存储，请更新完整安装包".into());
     }
@@ -985,7 +974,7 @@ async fn ensure_agent(state: &Desktop) -> Result<(Arc<Agent>, String, u64), Stri
     let session = a
         .request(
             "desktop/session",
-            json!({"thread_id":thread,"runtime_id":if i.view.session_id.is_empty(){None}else{Some(&i.view.session_id)},"operation":if i.view.session_id.is_empty(){"new"}else{"read"}}),
+            json!({"thread_id":thread,"session_id":native_id,"operation":if new_session{"new"}else{"read"}}),
         )
         .await?;
     apply_session(&mut i.view, &session)?;
@@ -1144,18 +1133,26 @@ async fn send_message(
             .request("thread/message", json!({"thread_id":thread,"input":text}))
             .await;
         let metrics = a
-            .request("desktop/session", json!({"thread_id":thread}))
-            .await
-            .ok();
+            .request(
+                "desktop/session",
+                json!({"thread_id":thread,"operation":"save"}),
+            )
+            .await;
         let mut i = inner.lock().await;
         if i.generation != generation {
             return;
         }
         i.view.busy = false;
         i.view.status = "就绪".into();
-        if let Some(metrics) = metrics {
-            if let Err(e) = apply_session(&mut i.view, &metrics) {
-                i.view.error = Some(e);
+        match metrics {
+            Ok(metrics) => {
+                if let Err(e) = apply_session(&mut i.view, &metrics) {
+                    i.view.error = Some(e);
+                }
+            }
+            Err(error) => {
+                i.view.status = "保存失败，保留执行恢复记录".into();
+                i.view.error = Some(error);
             }
         }
         if let Err(e) = result {
@@ -1191,8 +1188,24 @@ async fn interrupt_current(state: &Desktop) -> Result<(), String> {
 }
 async fn stop_internal(state: &Desktop) -> Result<(), String> {
     interrupt_current(state).await?;
-    let agent = state.inner.lock().await.agent.clone();
-    if let Some(agent) = agent {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while state.inner.lock().await.view.busy {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| "执行尚未排空，保留会话所有权；请稍后重试".to_string())?;
+    let target = {
+        let i = state.inner.lock().await;
+        i.agent.clone().zip(i.thread.clone())
+    };
+    if let Some((agent, thread)) = target {
+        agent
+            .request(
+                "desktop/session",
+                json!({"thread_id":thread,"operation":"save"}),
+            )
+            .await?;
         agent.kill().await;
     }
     let mut i = state.inner.lock().await;
@@ -1223,13 +1236,11 @@ async fn new_session(state: State<'_, Desktop>) -> Result<(), String> {
     stop_internal(&state).await?;
     {
         let mut i = state.inner.lock().await;
-        i.runtime = None;
         i.view.session_id.clear();
         i.view.messages.clear();
         i.view.cards.clear();
         i.view.metrics = Value::Null;
     }
-    ensure_agent(&state).await?;
     Ok(())
 }
 #[tauri::command]
@@ -1410,7 +1421,6 @@ fn main() {
                     generation: 0,
                     stop_requested: false,
                     credentials_changed: false,
-                    runtime: None,
                 })),
                 home,
                 resources,
@@ -1489,6 +1499,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             snapshot,
             conversations,
+            preview_conversation,
             select_conversation,
             open_folder,
             open_file,
@@ -1511,6 +1522,29 @@ fn main() {
             answer_questions,
             company_login
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let window = window.clone();
+                tauri::async_runtime::spawn(async move {
+                    let app = window.app_handle();
+                    let state = app.state::<Desktop>();
+                    let result = async {
+                        let _transition = state.begin_transition()?;
+                        stop_internal(&state).await
+                    }
+                    .await;
+                    match result {
+                        Ok(()) => {
+                            let _ = window.destroy();
+                        }
+                        Err(error) => {
+                            state.inner.lock().await.view.error = Some(error);
+                        }
+                    }
+                });
+            }
+        })
         .build(tauri::generate_context!())
         .expect("无法启动 Codewhale-MedSci")
         .run(|app, event| {
@@ -1558,46 +1592,15 @@ mod tests {
             return;
         };
         let home = PathBuf::from(home);
-        if let Ok(scope) = std::env::var("MEDSCI_TEST_SCOPE") {
-            assert!(
-                claim_runtime(&home, &scope).is_err(),
-                "another process owns this session"
-            );
-        } else {
-            assert!(
-                save_settings(&home, &Settings::default()).is_err(),
-                "another process is saving settings"
-            );
-        }
+        assert!(
+            save_settings(&home, &Settings::default()).is_err(),
+            "another process owns settings"
+        );
     }
+
     #[test]
     fn multi_instance_storage_and_settings() {
         let home = tempfile::tempdir().unwrap();
-        let first = new_runtime(home.path()).unwrap();
-        let second = new_runtime(home.path()).unwrap();
-        assert_ne!(first.path, second.path);
-        let scope = first.path.file_name().unwrap().to_str().unwrap();
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tests::multi_instance_child"])
-            .env("MEDSCI_TEST_HOME", home.path())
-            .env("MEDSCI_TEST_SCOPE", scope)
-            .output()
-            .unwrap();
-        assert!(
-            child.status.success(),
-            "{}",
-            String::from_utf8_lossy(&child.stdout)
-        );
-        let saved_path = first.path.clone();
-        std::fs::write(saved_path.join("history-receipt"), "keep").unwrap();
-        let scope = scope.to_string();
-        drop(first);
-        assert!(claim_runtime(home.path(), &scope).is_ok());
-        assert_eq!(
-            std::fs::read_to_string(saved_path.join("history-receipt")).unwrap(),
-            "keep"
-        );
-        assert!(claim_runtime(home.path(), "../escape").is_err());
         save_settings(home.path(), &Settings::default()).unwrap();
         let lock = open_lock(&home.path().join("settings.lock")).unwrap();
         lock.try_lock().unwrap();
@@ -1646,15 +1649,13 @@ mod tests {
             network: String::new(),
             python: String::new(),
         };
-        let session = json!({"runtime_id":"thr_native","usage":{"context":{"used_tokens":42}},"detail":{
-        "thread":{"id":"thr_native"},"items":[
-            {"kind":"user_message","detail":"继续任务"},
-            {"kind":"agent_reasoning","detail":"检查已有上下文"},
-            {"kind":"tool_call","status":"completed","metadata":{"tool_name":"File","tool_use_id":"call_1"}},
-            {"kind":"agent_message","detail":"接续工作"}
+        let session = json!({"session_id":"native-session","runtime_id":"thr_native","usage":{"context":{"used_tokens":42}},"detail":{
+            "thread":{"id":"thr_native"}},"saved":{"metadata":{"id":"native-session"},"messages":[
+            {"role":"user","display_user_prompt":"继续任务","content":[{"type":"text","text":"继续任务"}]},
+            {"role":"assistant","content":[{"type":"thinking","text":"检查已有上下文"},{"type":"tool_use","name":"File","id":"call_1"},{"type":"text","text":"接续工作"}]}
         ]}});
         apply_session(&mut view, &session).unwrap();
-        assert_eq!(view.session_id, "thr_native");
+        assert_eq!(view.session_id, "native-session");
         assert_eq!(
             view.messages
                 .iter()
@@ -1663,8 +1664,8 @@ mod tests {
             ["user", "reasoning", "assistant"]
         );
         assert_eq!(view.messages[2].text, "接续工作");
-        assert_eq!(view.cards[0]["sequence"], 3);
-        assert_eq!(view.messages[2].sequence, 4);
+        assert_eq!(view.cards[0]["sequence"], 4);
+        assert_eq!(view.messages[2].sequence, 5);
         assert_eq!(view.metrics["context"]["used_tokens"], 42);
         let before = view.session_id.clone();
         assert!(
@@ -1675,6 +1676,25 @@ mod tests {
             .is_err()
         );
         assert_eq!(view.session_id, before);
+        let saved = json!({"metadata":{"id":"saved-session"},"messages":[
+            {"role":"user","display_user_prompt":"真实输入","content":[{"type":"text","text":"真实输入"},{"type":"text","text":"<turn_meta>date</turn_meta>"}]},
+            {"role":"user","display_user_prompt":null,"content":[{"type":"text","text":"<codewhale:runtime_event kind=\"background_shell_completion\">output</codewhale:runtime_event>"},{"type":"text","text":"<turn_meta>runtime</turn_meta>"}]},
+            {"role":"user","display_user_prompt":null,"content":[{"type":"tool_result","tool_use_id":"tool_1","content":"tool output"}]},
+            {"role":"assistant","display_user_prompt":null,"content":[{"type":"text","text":"回答"}]}
+        ]});
+        apply_saved_session(&mut view, &saved).unwrap();
+        assert_eq!(
+            view.messages
+                .iter()
+                .map(|m| (m.role.as_str(), m.text.as_str()))
+                .collect::<Vec<_>>(),
+            [("user", "真实输入"), ("assistant", "回答")]
+        );
+        assert_eq!(
+            view.cards.len(),
+            1,
+            "tool results remain available outside the prompt outline"
+        );
     }
     #[test]
     fn reasoning_stream_preserves_text_order_and_final_response() {

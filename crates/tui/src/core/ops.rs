@@ -20,8 +20,8 @@ pub const USER_SHELL_TOOL_ID_PREFIX: &str = "user_shell_";
 /// Returned by `Op::GetSessionSnapshot` via a oneshot channel.
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
+    pub work_state: Result<Option<crate::session_manager::SessionWorkState>, String>,
     pub messages: Vec<Message>,
-    pub total_tokens: u64,
     pub model: String,
     /// Generic provider kind retained for serialized compatibility.
     pub model_provider: String,

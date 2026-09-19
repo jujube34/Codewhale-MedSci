@@ -126,7 +126,73 @@ fn own_process_tree(child: &Child) -> Result<std::os::windows::io::OwnedHandle, 
         Ok(job)
     }
 }
+fn native_command(binary: &Path, cwd: &Path, home: &Path) -> Command {
+    let mut cmd = Command::new(binary);
+    cmd.current_dir(cwd)
+        .env_clear()
+        .env("CODEWHALE_HOME", home)
+        .env("CODEWHALE_TELEMETRY", "0")
+        .kill_on_drop(true);
+    for name in [
+        "HOME",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "SystemRoot",
+        "SystemDrive",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "LANG",
+    ] {
+        if let Some(v) = std::env::var_os(name) {
+            cmd.env(name, v);
+        }
+    }
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+    cmd
+}
+
 impl Agent {
+    /// Read-only native commands have no model credentials or Runtime lease.
+    pub async fn native_session(
+        binary: &Path,
+        cwd: &Path,
+        operation: &str,
+        id: Option<&str>,
+    ) -> Result<Value, String> {
+        let home = codewhale_config::codewhale_home().map_err(|e| e.to_string())?;
+        let mut command = native_command(binary, cwd, &home);
+        command.arg("sessions");
+        match operation {
+            "list" => {
+                command
+                    .args(["list", "--json", "--limit", "500", "--workspace"])
+                    .arg(cwd);
+            }
+            "read" => {
+                command.arg("read").arg(id.ok_or("缺少原生会话 ID")?);
+            }
+            "allocate" => {
+                command.arg("allocate");
+            }
+            _ => return Err("不支持的原生会话操作".into()),
+        }
+        let output = tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+            .await
+            .map_err(|_| "原生会话读取超时".to_string())?
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "原生会话命令失败，请检查 sidecar 版本及目录权限：{}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|_| "原生会话协议不兼容，请更新完整安装包".into())
+    }
     pub async fn start(
         binary: &Path,
         cwd: &Path,
@@ -136,9 +202,9 @@ impl Agent {
         key_env: &str,
         python_bin: Option<&Path>,
         python_lease: Option<std::fs::File>,
-        runtime_dir: &Path,
+        session_id: &str,
     ) -> Result<(Arc<Self>, mpsc::Receiver<(Value, oneshot::Sender<()>)>), String> {
-        let mut cmd = Command::new(binary);
+        let mut cmd = native_command(binary, cwd, home);
         cmd.args([
             "app-server",
             "--stdio",
@@ -146,9 +212,7 @@ impl Agent {
             &config.to_string_lossy(),
         ])
         .current_dir(cwd)
-        .env_clear()
-        .env("CODEWHALE_HOME", home)
-        .env("CODEWHALE_RUNTIME_DIR", runtime_dir)
+        .env("CODEWHALE_SESSION_ID", session_id)
         .env("CODEWHALE_DESKTOP_SUPERVISED", "1")
         .env(key_env, key)
         .env("CODEWHALE_TELEMETRY", "0")
@@ -158,22 +222,6 @@ impl Agent {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-        for name in [
-            "HOME",
-            "USERPROFILE",
-            "LOCALAPPDATA",
-            "APPDATA",
-            "SystemRoot",
-            "WINDIR",
-            "TEMP",
-            "TMP",
-            "TMPDIR",
-            "LANG",
-        ] {
-            if let Some(v) = std::env::var_os(name) {
-                cmd.env(name, v);
-            }
-        }
         let system_path = if cfg!(windows) {
             std::env::var("SystemRoot")
                 .map(|v| format!("{v}\\System32;{v}"))

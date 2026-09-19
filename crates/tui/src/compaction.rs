@@ -318,6 +318,30 @@ pub(crate) fn is_compaction_checkpoint_message(message: &Message) -> bool {
     user_text_of(message).is_some_and(|text| is_compaction_summary_text(&text))
 }
 
+/// Restore the current history carrier without relocating it across later
+/// turns. Only histories predating that carrier use the legacy system prompt.
+/// The summary stays in append-only history, never in the pinned prefix.
+pub(crate) fn restore_compaction_checkpoint(
+    messages: &mut Vec<Message>,
+    legacy: Option<SystemPrompt>,
+) -> Option<SystemPrompt> {
+    if let Some(last) = messages.iter().rposition(is_compaction_checkpoint_message) {
+        let summary = user_text_of(&messages[last]).map(SystemPrompt::Text);
+        let mut index = 0;
+        messages.retain(|message| {
+            let keep = index == last || !is_compaction_checkpoint_message(message);
+            index += 1;
+            keep
+        });
+        summary
+    } else {
+        if let Some(summary) = legacy.as_ref() {
+            messages.push(compaction_checkpoint_message(summary));
+        }
+        legacy
+    }
+}
+
 pub(crate) fn estimate_tokens_for_message(message: &Message, include_thinking: bool) -> usize {
     message
         .content

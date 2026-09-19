@@ -1,16 +1,19 @@
 """Build an unsigned current-user NSIS installer from the cross-built payload."""
-import argparse,hashlib,json,pathlib,shutil,subprocess
+import argparse,hashlib,json,os,pathlib,shutil,subprocess
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--version',default='0.1.0-preview.7.5')
 parser.add_argument('--desktop-exe',type=pathlib.Path)
+parser.add_argument('--sidecar-exe',type=pathlib.Path)
+parser.add_argument('--makensis',default='makensis')
 args=parser.parse_args()
 if not args.version or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-' for c in args.version):parser.error('Invalid version')
 root=pathlib.Path(__file__).resolve().parents[2];artifacts=root/'desktop/artifacts';artifacts.mkdir(exist_ok=True)
 stage=artifacts/f'stage-windows-x86_64-{args.version}'
-if stage.exists():shutil.rmtree(stage)
+# Keep earlier packages intact; choose a new version for a new payload.
+if stage.exists():parser.error(f'Staging directory already exists: {stage}')
 stage.mkdir()
 exe=args.desktop_exe or root/'apps/desktop/target/x86_64-pc-windows-msvc/release/medsci-desktop.exe'
-agent=root/'target-windows/x86_64-pc-windows-msvc/release/codewhale.exe'
+agent=args.sidecar_exe or root/'target-windows/x86_64-pc-windows-msvc/release/codewhale.exe'
 shutil.copy2(exe,stage/exe.name)
 resources=stage/'resources';resources.mkdir();shutil.copy2(agent,resources/'codewhale.exe')
 runtime=root/'desktop/runtime';target=runtime/'windows-x86_64';payload=resources/'python';payload.mkdir()
@@ -95,6 +98,7 @@ Section "Uninstall"
 SectionEnd
 '''
 nsi=artifacts/f'windows-{args.version}.nsi';nsi.write_text(script,encoding='utf-8')
-subprocess.run(['makensis','-INPUTCHARSET','UTF8','-V2',str(nsi)],check=True)
+flag='/' if os.name=='nt' else '-'
+subprocess.run([args.makensis,flag+'INPUTCHARSET','UTF8',flag+'V2',str(nsi)],check=True)
 output.with_suffix('.exe.sha256').write_text(hashlib.sha256(output.read_bytes()).hexdigest()+'  '+output.name+'\n')
 print(output)

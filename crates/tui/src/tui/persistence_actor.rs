@@ -218,6 +218,7 @@ pub fn try_persist(request: PersistRequest) -> bool {
 /// `persist()` free function can reach it from anywhere in the TUI.
 pub fn spawn_persistence_actor(
     manager: SessionManager,
+    owner: Option<crate::task_manager::SharedTaskManager>,
 ) -> (PersistActorHandle, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = persistence_request_channel();
     let handle = PersistActorHandle { tx };
@@ -233,12 +234,13 @@ pub fn spawn_persistence_actor(
 
             // Flush pending work, log new failures, and fold the cycle's
             // results into the unreported accumulator.
-            fn flush_cycle(
+            async fn flush_cycle(
                 manager: &SessionManager,
                 pending: &mut PendingState,
                 unreported: &mut FlushReport,
+                owner: Option<&crate::task_manager::SharedTaskManager>,
             ) {
-                let cycle = flush_inner(manager, pending);
+                let cycle = flush_inner(manager, pending, owner).await;
                 log_flush_failures(&cycle);
                 unreported.merge(cycle);
             }
@@ -249,35 +251,39 @@ pub fn spawn_persistence_actor(
                     match pending.absorb(req) {
                         Control::Continue => {}
                         Control::Flush(reply) => {
-                            flush_cycle(&manager, &mut pending, &mut unreported);
+                            flush_cycle(&manager, &mut pending, &mut unreported, owner.as_ref())
+                                .await;
                             let _ = reply.send(std::mem::take(&mut unreported));
                         }
                         Control::Shutdown => {
-                            flush_cycle(&manager, &mut pending, &mut unreported);
+                            flush_cycle(&manager, &mut pending, &mut unreported, owner.as_ref())
+                                .await;
                             return;
                         }
                     }
                 }
 
                 // Write coalesced work.
-                flush_cycle(&manager, &mut pending, &mut unreported);
+                flush_cycle(&manager, &mut pending, &mut unreported, owner.as_ref()).await;
 
                 // Block until the next request arrives.
                 match rx.recv().await {
                     Some(req) => match pending.absorb(req) {
                         Control::Continue => {}
                         Control::Flush(reply) => {
-                            flush_cycle(&manager, &mut pending, &mut unreported);
+                            flush_cycle(&manager, &mut pending, &mut unreported, owner.as_ref())
+                                .await;
                             let _ = reply.send(std::mem::take(&mut unreported));
                         }
                         Control::Shutdown => {
-                            flush_cycle(&manager, &mut pending, &mut unreported);
+                            flush_cycle(&manager, &mut pending, &mut unreported, owner.as_ref())
+                                .await;
                             return;
                         }
                     },
                     None => {
                         // Channel closed — final flush and exit.
-                        flush_cycle(&manager, &mut pending, &mut unreported);
+                        flush_cycle(&manager, &mut pending, &mut unreported, owner.as_ref()).await;
                         return;
                     }
                 }
@@ -412,7 +418,24 @@ impl PendingState {
 /// commit clears its session's checkpoint only after that session's own
 /// write succeeded, so a failed save always leaves the crash-recovery
 /// checkpoint in place.
-fn flush_inner(manager: &SessionManager, pending: &mut PendingState) -> FlushReport {
+async fn flush_inner(
+    manager: &SessionManager,
+    pending: &mut PendingState,
+    owner: Option<&crate::task_manager::SharedTaskManager>,
+) -> FlushReport {
+    async fn save(
+        manager: &SessionManager,
+        owner: Option<&crate::task_manager::SharedTaskManager>,
+        session: &SavedSession,
+    ) -> std::io::Result<()> {
+        match owner {
+            Some(owner) => owner
+                .save_session_snapshot(manager, session)
+                .await
+                .map_err(std::io::Error::other),
+            None => manager.save_session(session).map(|_| ()),
+        }
+    }
     let mut report = FlushReport::default();
     let mut record = |what: String, result: std::io::Result<()>| match result {
         Ok(()) => report.completed += 1,
@@ -422,11 +445,11 @@ fn flush_inner(manager: &SessionManager, pending: &mut PendingState) -> FlushRep
     for (session_id, session) in std::mem::take(&mut pending.sessions) {
         record(
             format!("session:{session_id}"),
-            manager.save_session(&session).map(|_| ()),
+            save(manager, owner, &session).await,
         );
     }
     for (session_id, session) in std::mem::take(&mut pending.completed_commits) {
-        let commit_result = manager.save_session(&session);
+        let commit_result = save(manager, owner, &session).await;
         let save_succeeded = commit_result.is_ok();
         record(
             format!("completed-commit:{session_id}"),
@@ -519,7 +542,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let sessions_dir = tmp.path().join("sessions");
         let manager = SessionManager::new(sessions_dir.clone()).expect("manager");
-        let (handle, task) = spawn_persistence_actor(manager);
+        let (handle, task) = spawn_persistence_actor(manager, None);
 
         let queue_manager = SessionManager::new(sessions_dir.clone()).expect("queue manager");
         let lease_a = queue_manager
@@ -584,7 +607,7 @@ mod tests {
         let lease = manager
             .acquire_offline_queue_lease("session-A")
             .expect("queue lease");
-        let (handle, task) = spawn_persistence_actor(manager);
+        let (handle, task) = spawn_persistence_actor(manager, None);
 
         let state = OfflineQueueState {
             messages: vec![QueuedSessionMessage {
@@ -628,7 +651,7 @@ mod tests {
             Some("agent"),
         );
         let session_id = session.metadata.id.clone();
-        let (handle, task) = spawn_persistence_actor(manager);
+        let (handle, task) = spawn_persistence_actor(manager, None);
 
         handle.try_send(PersistRequest::SessionSnapshot(session));
         handle.try_send(PersistRequest::Shutdown);
@@ -666,7 +689,7 @@ mod tests {
         second.metadata.title = "Session B".to_string();
         let first_id = first.metadata.id.clone();
         let second_id = second.metadata.id.clone();
-        let (handle, task) = spawn_persistence_actor(manager);
+        let (handle, task) = spawn_persistence_actor(manager, None);
 
         handle.try_send(PersistRequest::SessionSnapshot(first));
         handle.try_send(PersistRequest::SessionSnapshot(second));
@@ -715,7 +738,7 @@ mod tests {
         );
         let first_id = first.metadata.id.clone();
         let second_id = second.metadata.id.clone();
-        let (handle, task) = spawn_persistence_actor(manager);
+        let (handle, task) = spawn_persistence_actor(manager, None);
 
         // Interleave: save A, save B, clear A — all coalesced into one drain.
         handle.try_send(PersistRequest::SaveCheckpoint { session: first });
@@ -753,7 +776,7 @@ mod tests {
             None,
             Some("agent"),
         );
-        let (handle, task) = spawn_persistence_actor(manager);
+        let (handle, task) = spawn_persistence_actor(manager, None);
 
         handle.try_send(PersistRequest::SaveCheckpoint { session });
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -786,7 +809,7 @@ mod tests {
             Some("agent"),
         );
         let session_id = session.metadata.id.clone();
-        let (handle, task) = spawn_persistence_actor(manager);
+        let (handle, task) = spawn_persistence_actor(manager, None);
 
         handle.try_send(PersistRequest::SaveCheckpoint { session });
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -844,7 +867,7 @@ mod tests {
         let session_id = session.metadata.id.clone();
         let checkpoint_path = seed_checkpoint_file(&sessions_dir, &session_id);
         block_session_file(&sessions_dir, &session_id);
-        let (handle, task) = spawn_persistence_actor(manager);
+        let (handle, task) = spawn_persistence_actor(manager, None);
 
         handle.try_send(PersistRequest::CompletedCommit { session });
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -890,7 +913,7 @@ mod tests {
         );
         let session_id = session.metadata.id.clone();
         let checkpoint_path = seed_checkpoint_file(&sessions_dir, &session_id);
-        let (handle, task) = spawn_persistence_actor(manager);
+        let (handle, task) = spawn_persistence_actor(manager, None);
 
         handle.try_send(PersistRequest::CompletedCommit { session });
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -944,7 +967,7 @@ mod tests {
         let inflight_checkpoint = verification_manager
             .save_checkpoint(&inflight)
             .expect("seed the concurrent session's checkpoint");
-        let (handle, task) = spawn_persistence_actor(manager);
+        let (handle, task) = spawn_persistence_actor(manager, None);
 
         handle.try_send(PersistRequest::CompletedCommit { session: committed });
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -982,7 +1005,7 @@ mod tests {
         );
         let session_id = session.metadata.id.clone();
         let checkpoint_path = seed_checkpoint_file(&sessions_dir, &session_id);
-        let (handle, task) = spawn_persistence_actor(manager);
+        let (handle, task) = spawn_persistence_actor(manager, None);
 
         handle.try_send(PersistRequest::SaveCheckpoint { session });
         handle.try_send(PersistRequest::Shutdown);
@@ -1024,7 +1047,7 @@ mod tests {
         // checkpoint arrives while the previous completion is still queued.
         inflight.metadata.id = completed.metadata.id.clone();
         let session_id = completed.metadata.id.clone();
-        let (handle, task) = spawn_persistence_actor(manager);
+        let (handle, task) = spawn_persistence_actor(manager, None);
 
         handle.try_send(PersistRequest::CompletedCommit { session: completed });
         handle.try_send(PersistRequest::SaveCheckpoint { session: inflight });
@@ -1057,8 +1080,8 @@ mod tests {
         handle.try_send(PersistRequest::Shutdown);
         task.await.expect("persistence actor join");
     }
-    #[test]
-    fn offline_queue_editor_lease_survives_until_pending_write_finishes() {
+    #[tokio::test]
+    async fn offline_queue_editor_lease_survives_until_pending_write_finishes() {
         let directory = tempfile::tempdir().expect("queue fixture");
         let manager = SessionManager::new(directory.path().join("sessions")).expect("manager");
         let lease = manager
@@ -1078,7 +1101,7 @@ mod tests {
         });
         drop(lease); // The old window changed session before the actor ran.
         assert!(manager.acquire_offline_queue_lease("session-A").is_err());
-        let report = flush_inner(&manager, &mut pending);
+        let report = flush_inner(&manager, &mut pending, None).await;
         assert!(report.failures.is_empty(), "draft write failed: {report:?}");
         assert_eq!(report.completed, 1);
         let _next_editor = manager

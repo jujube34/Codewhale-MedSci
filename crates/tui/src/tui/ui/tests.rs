@@ -27274,6 +27274,7 @@ async fn offline_queue_lifecycle_preserves_edits_and_explicit_reset() {
     }
     let (handle, task) = persistence_actor::spawn_persistence_actor(
         SessionManager::default_location().expect("actor store"),
+        None,
     );
     persistence_actor::init_actor(handle.clone());
     let mut app = create_test_app();

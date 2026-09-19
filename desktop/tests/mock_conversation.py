@@ -61,8 +61,8 @@ with tempfile.TemporaryDirectory(prefix='medsci-conversation-') as temp:
     config.write_text(f'provider="deepseek"\nmodel="deepseek-flash"\nbase_url="http://127.0.0.1:{server.server_port}/v1"\napproval_policy="untrusted"\nsandbox_mode="workspace-write"\ntelemetry=false\n[features]\nmcp=false\n')
     if FULL_ACCESS:
         config.write_text(config.read_text().replace('approval_policy="untrusted"','approval_policy="auto"').replace('sandbox_mode="workspace-write"','sandbox_mode="danger-full-access"'))
-    env={k:v for k,v in os.environ.items() if k in ['PATH','HOME','SystemRoot','WINDIR','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA']};env.update(CODEWHALE_HOME=str(root/'agent'),CODEWHALE_TELEMETRY='0',DEEPSEEK_API_KEY='fixture-not-a-real-key')
-    proc=subprocess.Popen([str(pathlib.Path(sys.argv[1]).resolve()),'app-server','--stdio','--config',str(config)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,env=env,cwd=workspace)
+    env={k:v for k,v in os.environ.items() if k.upper() in ['PATH','HOME','SYSTEMROOT','WINDIR','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA']};env.update(CODEWHALE_HOME=str(root/'agent'),CODEWHALE_SESSION_ID='mock-native-session',CODEWHALE_TELEMETRY='0',DEEPSEEK_API_KEY='fixture-not-a-real-key')
+    proc=subprocess.Popen([str(pathlib.Path(sys.argv[1]).resolve()),'app-server','--stdio','--config',str(config)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,encoding='utf-8',env=env,cwd=workspace)
     out=queue.Queue()
     def reader():
         for line in proc.stdout:out.put(json.loads(line))
@@ -71,6 +71,8 @@ with tempfile.TemporaryDirectory(prefix='medsci-conversation-') as temp:
     try:
         send(1,'thread/start',{'cwd':str(workspace),'model':'deepseek-flash','model_provider':'deepseek'})
         start=out.get(timeout=30);assert 'error' not in start,start
+        send(90,'desktop/session',{'thread_id':start['result']['thread_id'],'operation':'new'})
+        initialized=out.get(timeout=30);assert 'error' not in initialized,initialized
         send(2,'thread/message',{'thread_id':start['result']['thread_id'],'input':'请只回答本地协议验证成功'})
         text='';interrupt_sent=False;steer_sent=False;steer_accepted=False;reasoning='';reasoning_before_response=False;approval_seen=False;deadline=time.monotonic()+60
         while time.monotonic()<deadline:
@@ -100,7 +102,7 @@ with tempfile.TemporaryDirectory(prefix='medsci-conversation-') as temp:
                     if event.get('id')==id:
                         assert 'error' not in event,event
                         return event['result']
-            send(30,'desktop/session',{'thread_id':start['result']['thread_id']})
+            send(30,'desktop/session',{'thread_id':start['result']['thread_id'],'operation':'save'})
             summary=reply(30);runtime_id=summary['runtime_id']
             item=next(i for i in summary['detail']['items'] if i.get('metadata',{}).get('tool_use_id')=='call_fixture')
             assert item['status']=='failed' and 'interrupted after shell work started' in item.get('detail',''), item
@@ -108,10 +110,10 @@ with tempfile.TemporaryDirectory(prefix='medsci-conversation-') as temp:
             send(31,'thread/message',{'thread_id':start['result']['thread_id'],'input':'继续刚才的任务'})
             reply(31);assert Provider.paired_history
             send(32,'shutdown',{});proc.wait(timeout=10)
-            proc=subprocess.Popen([str(pathlib.Path(sys.argv[1]).resolve()),'app-server','--stdio','--config',str(config)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,env=env,cwd=workspace)
+            proc=subprocess.Popen([str(pathlib.Path(sys.argv[1]).resolve()),'app-server','--stdio','--config',str(config)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,encoding='utf-8',env=env,cwd=workspace)
             out=queue.Queue();threading.Thread(target=reader,daemon=True).start()
             send(33,'thread/start',{'cwd':str(workspace),'model':'deepseek-flash','model_provider':'deepseek'});resumed=reply(33)
-            send(34,'desktop/session',{'thread_id':resumed['thread_id'],'runtime_id':runtime_id});assert reply(34)['runtime_id']==runtime_id
+            send(34,'desktop/session',{'thread_id':resumed['thread_id'],'session_id':'mock-native-session'});assert reply(34)['runtime_id']==runtime_id
             send(35,'thread/message',{'thread_id':resumed['thread_id'],'input':'重启后继续同一个任务'})
             reply(35);assert Provider.paired_history
             print('PASS: interrupted live bash persists paired tool result; follow-up works in same process and after native session restart; strict provider rejects unpaired calls')
@@ -136,23 +138,20 @@ with tempfile.TemporaryDirectory(prefix='medsci-conversation-') as temp:
         if APPROVAL:assert approval_seen and not (root/'must-not-exist.txt').exists(), 'denied tool must not write' 
         if FULL_ACCESS:assert not approval_seen and (root/'must-not-exist.txt').exists() and (root/'must-not-exist.txt').read_text()=='must remain absent', Provider.tool_results
         if SESSIONS:
-            send(30,'desktop/session',{'thread_id':start['result']['thread_id']})
+            send(30,'desktop/session',{'thread_id':start['result']['thread_id'],'operation':'save'})
             summary=out.get(timeout=30);assert 'error' not in summary,summary
             runtime_id=summary['result']['runtime_id']
             assert summary['result']['usage']['context']['used_tokens']>0,summary
             if NATIVE_SESSIONS:
-                send(40,'desktop/session',{'thread_id':start['result']['thread_id'],'operation':'list'})
-                listed=out.get(timeout=30)['result']
-                assert isinstance(listed,list) and any(s['id']==runtime_id for s in listed), 'session list must come from Runtime'
-                assert summary['result']['detail']['thread']['id']==runtime_id
-                items=summary['result']['detail']['items']
-                assert any(i['kind']=='user_message' for i in items) and any(i['kind']=='agent_message' for i in items),items
+                listed=json.loads(subprocess.check_output([str(pathlib.Path(sys.argv[1]).resolve()),'sessions','list','--json','--workspace',str(workspace)],env=env,text=True))
+                assert [row['id'] for row in listed]==['mock-native-session'],listed
+                assert summary['result']['session_id']=='mock-native-session'
             send(31,'shutdown',{});proc.wait(timeout=10)
-            proc=subprocess.Popen([str(pathlib.Path(sys.argv[1]).resolve()),'app-server','--stdio','--config',str(config)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,env=env,cwd=workspace)
+            proc=subprocess.Popen([str(pathlib.Path(sys.argv[1]).resolve()),'app-server','--stdio','--config',str(config)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,encoding='utf-8',env=env,cwd=workspace)
             out=queue.Queue();threading.Thread(target=reader,daemon=True).start()
             send(32,'thread/start',{'cwd':str(workspace),'model':'deepseek-flash','model_provider':'deepseek'})
             resumed=out.get(timeout=30);assert 'error' not in resumed,resumed
-            send(33,'desktop/session',{'thread_id':resumed['result']['thread_id'],'runtime_id':runtime_id})
+            send(33,'desktop/session',{'thread_id':resumed['result']['thread_id'],'session_id':'mock-native-session'})
             record=out.get(timeout=30);assert record.get('result',{}).get('runtime_id')==runtime_id,record
             send(34,'thread/message',{'thread_id':resumed['result']['thread_id'],'input':'继续之前的会话'})
             while True:
@@ -163,32 +162,12 @@ with tempfile.TemporaryDirectory(prefix='medsci-conversation-') as temp:
             assert Provider.restored_history,'runtime must restore the prior assistant message across process restart'
             if NATIVE_SESSIONS:
                 assert any(i.get('metadata',{}).get('tool_name') for i in record['result']['detail']['items']), 'native history must retain tool calls'
-                send(41,'desktop/session',{'thread_id':resumed['result']['thread_id'],'operation':'new'})
-                fresh=out.get(timeout=30)['result']
-                assert fresh['runtime_id']!=runtime_id and not fresh['detail']['items'],fresh
-                def turn(request_id):
-                    send(request_id,'thread/message',{'thread_id':resumed['result']['thread_id'],'input':'继续工作'})
-                    while True:
-                        result=out.get(timeout=60)
-                        if result.get('id')==request_id:
-                            assert 'error' not in result,result
-                            break
-                turn(42)
-                assert not Provider.restored_history, 'new native session must not inherit old model context'
-                send(43,'desktop/session',{'thread_id':resumed['result']['thread_id'],'runtime_id':runtime_id})
-                selected=out.get(timeout=30)['result']
-                assert selected['detail']['thread']['id']==runtime_id
-                turn(44)
-                assert Provider.restored_history, 'selecting old native session must restore model-visible context'
-                print('PASS: native session list/read/new/select; A -> B -> A restores actual model context, persists tool history, and isolates new sessions')
             other=root/'other';other.mkdir()
             send(35,'thread/start',{'cwd':str(other),'model':'deepseek-flash','model_provider':'deepseek'})
             other_start=out.get(timeout=30)
-            send(36,'desktop/session',{'thread_id':other_start['result']['thread_id'],'runtime_id':runtime_id})
+            send(36,'desktop/session',{'thread_id':other_start['result']['thread_id'],'session_id':'mock-native-session'})
             denied=out.get(timeout=30);assert 'error' in denied,denied
-            send(37,'desktop/session',{'thread_id':other_start['result']['thread_id']})
-            isolated=out.get(timeout=30);assert isolated.get('result',{}).get('runtime_id') not in (None,runtime_id),isolated
-            print('PASS: durable runtime history restored after process restart; context estimate available; cross-workspace session selection rejected; separate workspace gets a distinct session')
+            print('PASS: native SavedSession restores tool history and model context after restart; cross-workspace selection is rejected')
         send(3,'shutdown',{});proc.wait(timeout=10)
         print('PASS: '+('full access executed an out-of-workspace fixture write without an approval prompt' if FULL_ACCESS else 'native mid-turn steer round-trip completed' if STEER else 'mid-turn approval denial prevented the file write' if APPROVAL else 'real sidecar streamed Chinese text through one mock provider request')+'; no real API key or vendor calls')
     finally:

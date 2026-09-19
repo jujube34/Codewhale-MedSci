@@ -36,6 +36,77 @@ mod recovery {
         config
     }
 
+    #[tokio::test]
+    async fn session_handoff_verifies_two_native_host_advances_and_rejects_divergence() -> Result<()>
+    {
+        let _env = crate::test_support::lock_test_env();
+        let dir = tempfile::tempdir()?;
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+        let workspace = dir.path().join("workspace");
+        fs::create_dir(&workspace)?;
+        let cfg = RuntimeThreadManagerConfig::for_session(dir.path().join("tasks"), "handoff");
+        let sessions = crate::session_manager::SessionManager::default_location()?;
+        let mut manager = RuntimeThreadManager::open(config(), workspace.clone(), cfg.clone())?;
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let user_message = |text: &str| Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: text.into(),
+                cache_control: None,
+            }],
+        };
+        let original = vec![user_message("original")];
+        manager
+            .seed_thread_from_messages(&thread.id, &original)
+            .await?;
+        let mut saved = crate::session_manager::create_saved_session_with_id_and_mode(
+            "handoff".into(),
+            &original,
+            &thread.model,
+            &workspace,
+            0,
+            None,
+            Some("agent"),
+        );
+        saved
+            .bind_runtime_store(manager.session_store_binding())
+            .map_err(anyhow::Error::msg)?;
+        sessions.save_session(&saved)?;
+        manager
+            .set_thread_session_checkpoint(&thread.id, &saved)
+            .await?;
+        for round in 0..2 {
+            drop(manager);
+            // The second host owns the same store and reads again under its lock.
+            let tui = RuntimeThreadManager::open(config(), workspace.clone(), cfg.clone())?;
+            let current = tui.load_owned_session(&sessions, "handoff")?;
+            let mut messages = current.messages.clone();
+            messages.push(user_message(&format!("TUI {round}")));
+            saved = crate::session_manager::update_session(current, &messages, 0, None);
+            sessions.save_session(&saved)?;
+            drop(tui);
+            manager = RuntimeThreadManager::open(config(), workspace.clone(), cfg.clone())?;
+            let current_thread = manager.store.load_thread(&thread.id)?;
+            assert_eq!(manager.restore_thread_messages(&current_thread)?, messages);
+            manager
+                .set_thread_session_checkpoint(&thread.id, &saved)
+                .await?;
+            assert_eq!(sessions.list_sessions()?.len(), 1);
+        }
+        let mut divergent = saved.messages.clone();
+        divergent[0] = user_message("unrelated history");
+        let divergent = crate::session_manager::update_session(saved, &divergent, 0, None);
+        sessions.save_session(&divergent)?;
+        assert!(
+            manager
+                .restore_thread_messages(&manager.store.load_thread(&thread.id)?)
+                .is_err()
+        );
+        Ok(())
+    }
+
     async fn close_engines(manager: &RuntimeThreadManager) -> Result<()> {
         let handles = manager
             .active

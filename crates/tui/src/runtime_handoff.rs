@@ -1041,6 +1041,35 @@ pub(crate) fn classify_user_turn_prompt(message: &Message) -> UserTurnPromptKind
     }
 }
 
+/// Read-only display text for native session consumers. Keep provenance
+/// classification here, beside edit-last-turn, instead of guessing from XML
+/// prefixes in each GUI. This never changes persisted or model-facing history.
+pub(crate) fn display_user_prompt(message: &Message) -> Option<String> {
+    if classify_user_turn_prompt(message) == UserTurnPromptKind::NotPrompt {
+        return None;
+    }
+    let metadata_index = turn_metadata_text(message).map(|(index, _)| index);
+    let parts: Vec<&str> = message
+        .content
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
+            if Some(index) == metadata_index {
+                return None;
+            }
+            match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            }
+        })
+        .collect();
+    Some(if parts.is_empty() {
+        "（附件指令）".into()
+    } else {
+        parts.join("\n\n")
+    })
+}
+
 /// Locate the latest real user boundary without skipping unsupported content.
 #[must_use]
 pub(crate) fn edit_last_turn_target(messages: &[Message]) -> EditLastTurnTarget {

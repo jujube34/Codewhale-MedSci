@@ -845,6 +845,14 @@ pub async fn run_tui(
             .and_then(|metadata| metadata.runtime_store.as_ref()),
     )
     .await?;
+    // The first read selected the store. Re-read the authoritative snapshot
+    // after the process-owner lock, before starting an Engine with its history.
+    if options.resume_session_id.is_some() && app.current_session_metadata.is_some() {
+        let saved = task_manager.load_owned_session(&session_id)?;
+        let goal = SessionManager::default_location()?.load_session_goal(&session_id)?;
+        apply_loaded_session_with_goal(&mut app, config, &saved, goal.as_ref())
+            .map_err(anyhow::Error::msg)?;
+    }
     if let Some(saved) = app
         .current_session_metadata
         .as_ref()
@@ -969,7 +977,10 @@ pub async fn run_tui(
     let persistence_runtime = SessionManager::default_location()
         .ok()
         .map(|persist_manager| {
-            let (handle, task) = persistence_actor::spawn_persistence_actor(persist_manager);
+            let (handle, task) = persistence_actor::spawn_persistence_actor(
+                persist_manager,
+                Some(task_manager.clone()),
+            );
             persistence_actor::init_actor(handle.clone());
             (handle, task)
         });

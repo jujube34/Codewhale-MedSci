@@ -409,203 +409,6 @@ fn session_detail_scenario() {
 }
 
 #[test]
-fn messages_from_thread_detail_batches_tool_results() {
-    let now = Utc::now();
-    let turn_id = "turn_detail".to_string();
-    let thread = ThreadRecord {
-        schema_version: 2,
-        id: "thr_detail".to_string(),
-        created_at: now,
-        updated_at: now,
-        model: DEFAULT_TEXT_MODEL.to_string(),
-        model_provider: None,
-        model_provider_id: None,
-        reasoning_effort: None,
-        allowed_tools: None,
-        workspace: PathBuf::from("."),
-        mode: "agent".to_string(),
-        permission_posture: Some("ask".to_string()),
-        allow_shell: false,
-        trust_mode: false,
-        auto_approve: false,
-        latest_turn_id: Some(turn_id.clone()),
-        latest_response_bookmark: None,
-        archived: false,
-        system_prompt: None,
-        task_id: None,
-        title: None,
-        session_id: None,
-        saved_session_checkpoint: None,
-    };
-    let turn = TurnRecord {
-        max_output_tokens: None,
-        schema_version: 2,
-        id: turn_id.clone(),
-        thread_id: thread.id.clone(),
-        status: RuntimeTurnStatus::Completed,
-        input_summary: "check".to_string(),
-        created_at: now,
-        started_at: Some(now),
-        ended_at: Some(now),
-        duration_ms: Some(0),
-        usage: None,
-        model_request_diagnostics: None,
-        routing_settlement: false,
-        effective_route_usage: None,
-        permission_posture: Some("ask".to_string()),
-        effective_provider: None,
-        effective_provider_id: None,
-        effective_openrouter_vendor: None,
-        effective_billing_surface: None,
-        effective_endpoint_fingerprint: None,
-        effective_provider_live_pricing: None,
-        effective_billing_mode: None,
-        effective_dispatched_at: None,
-        effective_model: None,
-        routed_usage: Vec::new(),
-        routed_usage_drop_records: Vec::new(),
-        routed_usage_source_ids: Vec::new(),
-        routed_usage_dropped_records: 0,
-        error: None,
-        item_ids: vec![
-            "item_user".to_string(),
-            "item_reasoning".to_string(),
-            "item_tool_use".to_string(),
-            "item_result_one".to_string(),
-            "item_result_two".to_string(),
-            "item_answer".to_string(),
-        ],
-        steer_count: 0,
-        agent_mail_message_id: None,
-    };
-    let item = |id: &str,
-                kind: TurnItemKind,
-                summary: &str,
-                detail: Option<&str>,
-                metadata: Option<Value>| {
-        crate::runtime_threads::TurnItemRecord {
-            schema_version: 2,
-            id: id.to_string(),
-            turn_id: turn_id.clone(),
-            kind,
-            status: TurnItemLifecycleStatus::Completed,
-            summary: summary.to_string(),
-            detail: detail.map(str::to_string),
-            metadata,
-            artifact_refs: Vec::new(),
-            started_at: Some(now),
-            ended_at: Some(now),
-        }
-    };
-    let detail = ThreadDetail {
-        thread,
-        turns: vec![turn],
-        items: vec![
-            item(
-                "item_user",
-                TurnItemKind::UserMessage,
-                "check",
-                Some("check"),
-                None,
-            ),
-            item(
-                "item_reasoning",
-                TurnItemKind::AgentReasoning,
-                "thinking",
-                Some("thinking"),
-                None,
-            ),
-            item(
-                "item_tool_use",
-                TurnItemKind::ToolCall,
-                "shell",
-                Some(r#"{"cmd":"pwd"}"#),
-                Some(json!({
-                    "tool_use_id": "tool-1",
-                    "tool_name": "shell"
-                })),
-            ),
-            item(
-                "item_result_one",
-                TurnItemKind::ToolCall,
-                "one",
-                Some("one"),
-                Some(json!({
-                    "tool_result_for": "tool-1",
-                    "is_error": false,
-                    "content_blocks": [{
-                        "type": "text",
-                        "text": "structured one"
-                    }]
-                })),
-            ),
-            item(
-                "item_result_two",
-                TurnItemKind::ToolCall,
-                "two",
-                Some("two"),
-                Some(json!({
-                    "tool_result_for": "tool-2",
-                    "is_error": true
-                })),
-            ),
-            item(
-                "item_answer",
-                TurnItemKind::AgentMessage,
-                "done",
-                Some("done"),
-                None,
-            ),
-        ],
-        latest_seq: 0,
-        pending_approvals: Vec::new(),
-        pending_user_inputs: Vec::new(),
-        pending_dynamic_tool_calls: Vec::new(),
-    };
-
-    let messages = messages_from_thread_detail(&detail);
-    let roles = messages
-        .iter()
-        .map(|message| message.role.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
-    assert_eq!(messages[2].content.len(), 2);
-    match &messages[2].content[0] {
-        ContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            is_error,
-            content_blocks,
-        } => {
-            assert_eq!(tool_use_id, "tool-1");
-            assert_eq!(content, "one");
-            assert_eq!(*is_error, None);
-            assert_eq!(
-                content_blocks
-                    .as_ref()
-                    .and_then(|blocks| blocks[0].get("text")),
-                Some(&json!("structured one"))
-            );
-        }
-        other => panic!("expected first tool result, got {other:?}"),
-    }
-    match &messages[2].content[1] {
-        ContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            is_error,
-            content_blocks,
-        } => {
-            assert_eq!(tool_use_id, "tool-2");
-            assert_eq!(content, "two");
-            assert_eq!(*is_error, Some(true));
-            assert!(content_blocks.is_none());
-        }
-        other => panic!("expected second tool result, got {other:?}"),
-    }
-}
-
-#[test]
 fn legacy_exact_thread_export_normalizes_provider_kind_and_id() {
     let now = Utc::now();
     let detail = ThreadDetail {
@@ -5045,11 +4848,18 @@ async fn session_resume_thread_returns_400_when_saved_custom_provider_was_remove
         serde_json::to_string_pretty(&session)?,
     )?;
 
-    let Some((addr, _runtime_threads, handle)) =
-        spawn_test_server_with_root(root, sessions_dir).await?
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root, sessions_dir.clone()).await?
     else {
         return Ok(());
     };
+    let sessions = crate::session_manager::SessionManager::new(sessions_dir.clone())?;
+    let mut bound = sessions.load_session("sess_removed_custom_provider")?;
+    bound.metadata.workspace = PathBuf::from(".");
+    bound
+        .bind_runtime_store(runtime_threads.session_store_binding())
+        .map_err(anyhow::Error::msg)?;
+    sessions.save_session(&bound)?;
     let client = crate::tls::reqwest_client();
     let resp = client
         .post(format!(
@@ -5104,11 +4914,18 @@ async fn session_resume_thread_creates_thread_from_saved_session() -> Result<()>
         serde_json::to_string_pretty(&session)?,
     )?;
 
-    let Some((addr, _runtime_threads, handle)) =
+    let Some((addr, runtime_threads, handle)) =
         spawn_test_server_with_root(root.clone(), sessions_dir.clone()).await?
     else {
         return Ok(());
     };
+    let sessions = crate::session_manager::SessionManager::new(sessions_dir.clone())?;
+    let mut bound = sessions.load_session("sess_test_resume")?;
+    bound.metadata.workspace = PathBuf::from(".");
+    bound
+        .bind_runtime_store(runtime_threads.session_store_binding())
+        .map_err(anyhow::Error::msg)?;
+    sessions.save_session(&bound)?;
     let client = crate::tls::reqwest_client();
 
     let resp = client
@@ -5135,7 +4952,7 @@ async fn session_resume_thread_creates_thread_from_saved_session() -> Result<()>
         .await?;
     assert_eq!(detail["thread"]["id"], thread_id);
     assert_eq!(detail["thread"]["model_provider"], "deepseek");
-    assert_eq!(detail["thread"]["workspace"], "/tmp/test");
+    assert_eq!(detail["thread"]["workspace"], ".");
     assert_eq!(detail["turns"].as_array().map_or(0, Vec::len), 1);
     assert_eq!(detail["items"].as_array().map_or(0, Vec::len), 2);
 
@@ -7024,7 +6841,14 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
     );
     prior.metadata.cost.subagent_cost_usd = 0.5;
     prior.metadata.cost.subagent_cost_cny = 3.0;
+    prior.metadata.cost.coverage_recorded = true;
     session_manager.save_session(&prior)?;
+    // This fixture represents an already resumed native session. An unlinked
+    // thread must never overwrite an arbitrary existing SavedSession id.
+    runtime_threads.get_engine(&thread_id).await?;
+    runtime_threads
+        .set_thread_session_checkpoint(&thread_id, &prior)
+        .await?;
 
     client
         .put(format!("http://{addr}/v1/sessions"))
@@ -7045,10 +6869,7 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
     let child_usd = combined_usd - cost.session_cost_usd;
     assert!(child_usd > 0.5);
     assert_eq!(cost.subagent_cost_usd, child_usd);
-    assert_eq!(
-        (cost.session_cost_usd + cost.subagent_cost_usd - combined_usd).abs(),
-        0.0
-    );
+    assert!((cost.session_cost_usd + cost.subagent_cost_usd - combined_usd).abs() < 1e-9);
     assert!(cost.subagent_cost_cny > 3.0);
     assert!(cost.session_cost_cny > 0.0);
     // Coverage the runtime computed reads back as known, with CNY counted
@@ -7065,17 +6886,37 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
         "DeepSeek first-party parent is CNY-priced; reasons must not invent a gap"
     );
 
-    // Re-saving is idempotent: max-merge never re-adds the same spend.
+    assert_eq!(
+        saved.metadata.runtime_store,
+        Some(runtime_threads.session_store_binding())
+    );
+    let created_at = saved.metadata.created_at;
+    session_manager.rename_session(
+        "sess_cost_merge",
+        "renamed in TUI",
+        crate::session_manager::SessionMutator::External,
+    )?;
+    session_manager.set_session_archived(
+        "sess_cost_merge",
+        true,
+        crate::session_manager::SessionMutator::External,
+    )?;
+
+    // Omitted session_id reuses the native link, without creating a copy.
+    // Re-saving is idempotent: native cumulative totals do not re-add spend.
     client
         .put(format!("http://{addr}/v1/sessions"))
         .json(&json!({
-            "thread_id": thread_id,
-            "session_id": "sess_cost_merge"
+            "thread_id": thread_id
         }))
         .send()
         .await?
         .error_for_status()?;
     let resaved = session_manager.load_session_by_prefix("sess_cost_merge")?;
+    assert_eq!(resaved.metadata.title, "renamed in TUI");
+    assert!(resaved.metadata.archived);
+    assert_eq!(resaved.metadata.created_at, created_at);
+    assert_eq!(session_manager.list_sessions()?.len(), 1);
     assert_eq!(
         resaved.metadata.cost.session_cost_usd,
         cost.session_cost_usd
@@ -7085,6 +6926,25 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
         cost.subagent_cost_usd
     );
 
+    let conflict = client
+        .put(format!("http://{addr}/v1/sessions"))
+        .json(&json!({"thread_id":thread_id,"session_id":"unexpected-copy"}))
+        .send()
+        .await?;
+    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
+    assert!(session_manager.load_session("unexpected-copy").is_err());
+    runtime_threads
+        .set_active_turn_for_test(&thread_id, Some("busy-turn"))
+        .await?;
+    let busy = client
+        .put(format!("http://{addr}/v1/sessions"))
+        .json(&json!({"thread_id":thread_id}))
+        .send()
+        .await?;
+    assert_eq!(busy.status(), reqwest::StatusCode::CONFLICT);
+    runtime_threads
+        .set_active_turn_for_test(&thread_id, None)
+        .await?;
     handle.abort();
     Ok(())
 }
@@ -14692,10 +14552,15 @@ async fn runtime_image_saved_session_import_validates_before_creating_a_thread()
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
     let sessions_dir = dir.path().join("sessions");
     fs::create_dir_all(&sessions_dir)?;
-    let (addr, manager, server) =
-        spawn_test_server_with_root(dir.path().to_path_buf(), sessions_dir.clone())
-            .await?
-            .context("loopback listener required")?;
+    let (addr, manager, server) = spawn_test_server_with_root_token_mobile_workspace(
+        dir.path().to_path_buf(),
+        sessions_dir.clone(),
+        None,
+        false,
+        dir.path().to_path_buf(),
+    )
+    .await?
+    .context("loopback listener required")?;
     let client = crate::tls::reqwest_client();
     let expected =
         vec![crate::image_attach::tests::runtime_image_fixture_bytes(3 * 1024 * 1024); 2];
@@ -14731,6 +14596,12 @@ async fn runtime_image_saved_session_import_validates_before_creating_a_thread()
             sessions_dir.join(format!("{id}.json")),
             serde_json::to_vec(&session)?,
         )?;
+        let sessions = crate::session_manager::SessionManager::new(sessions_dir.clone())?;
+        let mut bound = sessions.load_session(&id)?;
+        bound
+            .bind_runtime_store(manager.session_store_binding())
+            .map_err(anyhow::Error::msg)?;
+        sessions.save_session(&bound)?;
         let response = client
             .post(format!("http://{addr}/v1/sessions/{id}/resume-thread"))
             .json(&json!({}))

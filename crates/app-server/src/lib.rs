@@ -1494,7 +1494,7 @@ async fn interrupt_stdio_turn(
     Ok(true)
 }
 
-/// Desktop sessions reuse durable Runtime threads, including tool history.
+/// Thin transport over native SavedSession operations. Runtime ids remain internal.
 async fn desktop_session(
     state: &AppState,
     params: Value,
@@ -1509,147 +1509,107 @@ async fn desktop_session(
         .get(key)
         .cloned()
         .ok_or_else(|| JsonRpcError::invalid_params("unknown desktop thread"))?;
-    let workspace = hint
-        .workspace
-        .as_ref()
-        .ok_or_else(|| JsonRpcError::invalid_params("missing workspace"))?
-        .canonicalize()
-        .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
-    let full = {
-        let config = state.config.read().await;
-        config.approval_policy.as_deref() == Some("auto")
-            && config.sandbox_mode.as_deref() == Some("danger-full-access")
-    };
-    let shared = acquire_runtime_bridge(state).await?;
-    let mut bridge = shared.lock().await;
-    // The Runtime store is the sole session authority; desktop only projects it.
     let operation = params["operation"].as_str().unwrap_or("read");
-    if operation == "list" && std::env::var("CODEWHALE_DESKTOP_SUPERVISED").as_deref() == Ok("1") {
-        let records = bridge
-            .request_json(
-                bridge.authed(
-                    bridge
-                        .client
-                        .get(format!("{}/v1/desktop/history", bridge.base_url)),
-                ),
-            )
-            .await
-            .map_err(|e| JsonRpcError::runtime_unavailable(e.to_string()))?;
-        return Ok(Value::Array(
-            records
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|record| {
-                    record["workspace"]
-                        .as_str()
-                        .and_then(|p| Path::new(p).canonicalize().ok())
-                        .as_ref()
-                        == Some(&workspace)
-                })
-                .cloned()
-                .collect(),
+    if !matches!(operation, "new" | "read" | "save") {
+        return Err(JsonRpcError::invalid_params("invalid session operation"));
+    }
+    let session_id = params["session_id"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| std::env::var("CODEWHALE_SESSION_ID").ok())
+        .ok_or_else(|| JsonRpcError::invalid_params("native session_id is required"))?;
+    if session_id.is_empty()
+        || !session_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(JsonRpcError::invalid_params("invalid session_id"));
+    }
+    if std::env::var("CODEWHALE_SESSION_ID").as_deref() != Ok(session_id.as_str()) {
+        return Err(JsonRpcError::invalid_params(
+            "session_id must match the native session owned by this host",
         ));
     }
-    let mut latest = None;
-    if matches!(operation, "list" | "latest") {
-        let records = bridge
+    if let Some(workspace) = hint.workspace.as_ref() {
+        let requested = workspace.canonicalize().map_err(|e| {
+            JsonRpcError::invalid_params(format!("Cannot resolve session workspace: {e}"))
+        })?;
+        let owned = std::env::current_dir()
+            .and_then(|cwd| cwd.canonicalize())
+            .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+        if requested != owned {
+            return Err(JsonRpcError::invalid_params(
+                "Start a separate native session host for another workspace",
+            ));
+        }
+    }
+    let shared = acquire_runtime_bridge(state).await?;
+    let mut bridge = shared.lock().await;
+    let id = if let Some(id) = bridge.thread_map.get(key) {
+        id.clone()
+    } else if operation == "new" {
+        let full = {
+            let config = state.config.read().await;
+            config.approval_policy.as_deref() == Some("auto")
+                && config.sandbox_mode.as_deref() == Some("danger-full-access")
+        };
+        bridge
+            .ensure_runtime_thread(key, Some(hint), full.then_some("full_access"))
+            .await
+            .map_err(|e| JsonRpcError::runtime_unavailable(e.to_string()))?
+    } else {
+        let resumed = bridge
             .request_json(
-                bridge.authed(bridge.client.get(format!("{}/v1/threads", bridge.base_url))),
+                bridge
+                    .authed(bridge.client.post(format!(
+                        "{}/v1/sessions/{session_id}/resume-thread",
+                        bridge.base_url
+                    )))
+                    .json(&json!({})),
             )
             .await
             .map_err(|e| JsonRpcError::runtime_unavailable(e.to_string()))?;
-        let mut sessions = Vec::new();
-        for record in records.as_array().into_iter().flatten() {
-            if record["workspace"]
-                .as_str()
-                .and_then(|p| Path::new(p).canonicalize().ok())
-                .as_ref()
-                != Some(&workspace)
-            {
-                continue;
-            }
-            if latest.is_none() {
-                latest = record["id"].as_str().map(str::to_owned);
-            }
-            if operation == "list" {
-                let id = record["id"]
-                    .as_str()
-                    .ok_or_else(|| JsonRpcError::internal("Runtime session missing id"))?;
-                let detail = bridge
-                    .request_json(
-                        bridge.authed(
-                            bridge
-                                .client
-                                .get(format!("{}/v1/threads/{id}", bridge.base_url)),
-                        ),
-                    )
-                    .await
-                    .map_err(|e| JsonRpcError::runtime_unavailable(e.to_string()))?;
-                let title = record["title"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        detail["turns"]
-                            .as_array()
-                            .and_then(|t| t.first())
-                            .and_then(|t| t["input_summary"].as_str())
-                    })
-                    .unwrap_or("新会话");
-                sessions.push(json!({"id":id,"title":title,"updated":record["updated_at"]}));
-            }
-        }
-        if operation == "list" {
-            return Ok(json!(sessions));
-        }
-    }
-    if operation == "new" {
-        bridge.thread_map.remove(key);
-    }
-    let selected = params["runtime_id"].as_str().or(latest.as_deref());
-    let id = if let Some(id) = selected {
-        if id.is_empty()
-            || !id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        {
-            return Err(JsonRpcError::invalid_params("invalid runtime session id"));
-        }
-        id.to_owned()
-    } else {
-        bridge
-            .ensure_runtime_thread(key, Some(hint.clone()), full.then_some("full_access"))
-            .await
-            .map_err(|e| JsonRpcError::runtime_unavailable(e.to_string()))?
+        let id = resumed["thread_id"]
+            .as_str()
+            .ok_or_else(|| JsonRpcError::internal("native resume omitted thread_id"))?
+            .to_string();
+        bridge.thread_map.insert(key.to_string(), id.clone());
+        id
     };
+    if matches!(operation, "new" | "save") {
+        bridge
+            .request_json(
+                bridge
+                    .authed(
+                        bridge
+                            .client
+                            .put(format!("{}/v1/sessions", bridge.base_url)),
+                    )
+                    .json(&json!({"thread_id":id,"session_id":session_id})),
+            )
+            .await
+            .map_err(|e| JsonRpcError::runtime_unavailable(e.to_string()))?;
+    }
     let url = format!("{}/v1/threads/{id}", bridge.base_url);
     let detail = bridge
         .request_json(bridge.authed(bridge.client.get(&url)))
         .await
         .map_err(|e| JsonRpcError::runtime_unavailable(e.to_string()))?;
-    let stored_workspace = detail
-        .pointer("/thread/workspace")
-        .and_then(Value::as_str)
-        .and_then(|p| Path::new(p).canonicalize().ok());
-    if stored_workspace.as_ref() != Some(&workspace) {
-        return Err(JsonRpcError::invalid_params(
-            "session belongs to another workspace",
-        ));
+    if detail["thread"]["session_id"].as_str() != Some(session_id.as_str()) {
+        return Err(JsonRpcError::internal("native session binding mismatch"));
     }
-    if full && selected.is_some() {
-        bridge.request_json(bridge.authed(bridge.client.patch(&url)).json(&json!({
-            "permission_posture":"full_access", "trust_mode":true, "allow_shell":true, "model":hint.model
-        }))).await.map_err(|e| JsonRpcError::runtime_unavailable(e.to_string()))?;
-    }
-    bridge.thread_map.insert(key.to_owned(), id.clone());
     bridge
         .last_seq_by_thread
         .insert(id.clone(), detail["latest_seq"].as_u64().unwrap_or(0));
     let usage = bridge
         .request_json(bridge.authed(bridge.client.get(format!("{url}/usage"))))
         .await
-        .ok();
-    Ok(json!({"runtime_id":id,"usage":usage,"detail":detail}))
+        .map_err(|e| JsonRpcError::runtime_unavailable(e.to_string()))?;
+    let saved = bridge
+        .request_json(bridge.authed(bridge.client.get(format!("{}/v1/sessions/{session_id}", bridge.base_url))))
+        .await
+        .map_err(|e| JsonRpcError::runtime_unavailable(e.to_string()))?;
+    Ok(json!({"session_id":session_id,"runtime_id":id,"usage":usage,"detail":detail,"saved":saved}))
 }
 
 /// Mid-turn desktop decisions use the copied live-turn address, never the
@@ -2398,7 +2358,7 @@ async fn dispatch_stdio_request_with_writer<W: AsyncWrite + Unpin>(
                     "transport": transport.label(),
                     "families": ["thread/*", "app/*", "prompt/*"],
                     "turn_image_inputs": true,
-                    "desktop_multi_instance": true,
+                    "native_session_interop": true,
                     "methods": methods,
                 }),
                 should_exit: false,

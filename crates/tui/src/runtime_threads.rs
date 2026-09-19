@@ -728,9 +728,23 @@ pub struct ThreadRecord {
 pub struct SavedSessionCheckpoint {
     pub covered_turn_id: Option<String>,
     pub messages_sha256: String,
+    /// Length of the verified full snapshot, used to prove an append-only host handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<usize>,
     /// A backtracked fork may retain only a prefix of the verified snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_messages: Option<usize>,
+    /// Write-ahead digest for a native host's next atomic SavedSession write.
+    /// After a crash either the old digest or this exact new digest must match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingSessionCheckpoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingSessionCheckpoint {
+    pub covered_turn_id: Option<String>,
+    pub messages_sha256: String,
+    pub message_count: usize,
 }
 
 fn session_messages_sha256(messages: &[Message]) -> Result<String> {
@@ -2998,7 +3012,7 @@ fn default_runtime_store_root(task_data_dir: &Path, session_id: Option<&str>) ->
     }
 }
 
-fn is_runtime_session_scope(id: &str) -> bool {
+pub(crate) fn is_runtime_session_scope(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id
@@ -4763,10 +4777,72 @@ impl RuntimeThreadManager {
         }
     }
 
-    /// Native desktop history across isolated Runtime stores, including the
-    /// pre-multi-instance store. No GUI database or copied conversation data.
-    pub(crate) fn desktop_history(&self) -> Result<Vec<Value>> {
-        let root = &self.manager_cfg.task_data_dir;
+    /// Read the snapshot only after this manager owns the native Runtime lock.
+    /// Both interactive and API hosts use this final read before execution.
+    pub(crate) fn load_owned_session(
+        &self,
+        sessions: &crate::session_manager::SessionManager,
+        id: &str,
+    ) -> Result<crate::session_manager::SavedSession> {
+        let session = sessions.load_session(id)?;
+        let actual = self.session_store_binding();
+        match session.metadata.runtime_store.as_ref() {
+            Some(saved) if saved == &actual => saved.validate_existing_store()?,
+            Some(saved) if saved.is_missing_session_store()? => {
+                let expected = RuntimeThreadManagerConfig::for_session(
+                    self.manager_cfg.task_data_dir.clone(),
+                    id,
+                )
+                .data_dir
+                .with_file_name("runtime-recovered-session");
+                anyhow::ensure!(
+                    actual.data_dir == checked_runtime_store_root(expected)?,
+                    "Session recovery belongs to another Runtime owner"
+                );
+            }
+            Some(_) => {
+                bail!("Session Runtime ownership changed; reopen the session before execution")
+            }
+            None => {
+                let expected = RuntimeThreadManagerConfig::for_session(
+                    self.manager_cfg.task_data_dir.clone(),
+                    id,
+                )
+                .data_dir;
+                anyhow::ensure!(
+                    actual.data_dir == checked_runtime_store_root(expected)?,
+                    "Session requires its own native Runtime host; reopen with the session ID"
+                );
+            }
+        }
+        anyhow::ensure!(
+            crate::session_manager::workspace_scope_matches(
+                &session.metadata.workspace,
+                &self.workspace
+            ),
+            "Session belongs to another workspace"
+        );
+        Ok(session)
+    }
+
+    /// A host loading only SavedSession must not discard an unsaved Runtime tail.
+    pub(crate) fn require_saved_runtime_boundary(
+        &self,
+        session: &crate::session_manager::SavedSession,
+    ) -> Result<()> {
+        for thread in self.store.list_threads()?.into_iter().filter(|thread| {
+            thread.session_id.as_deref() == Some(&session.metadata.id) && thread.task_id.is_none()
+        }) {
+            anyhow::ensure!(
+                self.restore_thread_messages(&thread)? == session.messages,
+                "Session has unpublished Runtime history; resume its Runtime thread and save it before opening the TUI"
+            );
+        }
+        Ok(())
+    }
+
+    /// Explicit, read-only inventory of legacy stores. Never used by the daily session list.
+    pub(crate) fn legacy_runtime_inventory(root: &Path) -> Result<Vec<Value>> {
         let mut stores = vec![("legacy".to_string(), root.join("runtime"))];
         let desktop = root.join("desktop");
         if desktop.exists() {
@@ -4787,9 +4863,6 @@ impl RuntimeThreadManager {
                 continue;
             }
             for thread in RuntimeThreadStore::list_threads_in(&threads)? {
-                if thread.archived {
-                    continue;
-                }
                 let mut title = thread.title.clone().filter(|v| !v.is_empty());
                 if title.is_none()
                     && let Some(turn_id) = &thread.latest_turn_id
@@ -4804,8 +4877,20 @@ impl RuntimeThreadManager {
                     );
                     title = Some(turn.input_summary);
                 }
-                history.push(json!({"id":thread.id,"title":title,
-                    "updated":thread.updated_at,"workspace":thread.workspace,"store":scope}));
+                let lease = RuntimeProcessOwnerLock::try_acquire_file(
+                    &store.join(RUNTIME_PROCESS_OWNER_LOCK_FILE),
+                    false,
+                );
+                let occupied = match &lease {
+                    Ok(Some(_)) => Some(false),
+                    Ok(None) => Some(true),
+                    Err(_) => None,
+                };
+                history.push(json!({"thread_id":thread.id,"title":title,
+                    "updated":thread.updated_at,"workspace":thread.workspace,"store":store,"legacy_scope":scope,
+                    "session_id":thread.session_id,"checkpoint":thread.saved_session_checkpoint,
+                    "occupied":occupied,"ownership_error":lease.as_ref().err().map(|error| error.to_string()),
+                    "recoverability":if thread.latest_turn_id.is_some(){"native_runtime_records_require_import_validation"}else{"empty"}}));
             }
         }
         history.sort_by(|a, b| b["updated"].as_str().cmp(&a["updated"].as_str()));
@@ -6893,6 +6978,21 @@ impl RuntimeThreadManager {
     }
 
     pub async fn create_thread(&self, req: CreateThreadRequest) -> Result<ThreadRecord> {
+        let session_id = std::env::var("CODEWHALE_SESSION_ID")
+            .ok()
+            .filter(|_| req.task_id.is_none());
+        if let Some(id) = session_id.as_deref() {
+            anyhow::ensure!(is_runtime_session_scope(id), "Invalid native session ID");
+            anyhow::ensure!(
+                !self
+                    .store
+                    .list_threads()?
+                    .iter()
+                    .any(|thread| thread.session_id.as_deref() == Some(id)
+                        && thread.task_id.is_none()),
+                "This native session already has a Runtime thread; resume it instead of creating a copy"
+            );
+        }
         let now = Utc::now();
         let reasoning_effort = canonical_runtime_reasoning_effort(req.reasoning_effort.as_deref())?;
         let (model_provider, model_provider_id, default_model) = {
@@ -6976,7 +7076,7 @@ impl RuntimeThreadManager {
             system_prompt: req.system_prompt,
             task_id: req.task_id,
             title: None,
-            session_id: None,
+            session_id,
             saved_session_checkpoint: None,
         };
         self.store.save_thread(&thread)?;
@@ -7487,6 +7587,17 @@ impl RuntimeThreadManager {
         Arc::clone(&self.config_admission).write_owned().await
     }
 
+    /// A terminal store receipt can precede the monitor draining the Engine.
+    /// Snapshot callers hold checkpoint admission while checking both states.
+    pub(crate) async fn thread_has_active_turn(&self, id: &str) -> bool {
+        self.active
+            .lock()
+            .await
+            .engines
+            .get(id)
+            .is_some_and(|state| state.active_turn.is_some())
+    }
+
     /// Exclude new turns and saved-history/config changes while a restore
     /// mutates files. Active turns in any overlapping workspace (the same
     /// tree, a parent or a nested checkout) are rejected instead of raced.
@@ -7584,7 +7695,9 @@ impl RuntimeThreadManager {
             thread.saved_session_checkpoint = Some(SavedSessionCheckpoint {
                 covered_turn_id: thread.latest_turn_id.clone(),
                 messages_sha256,
+                message_count: Some(session.messages.len()),
                 retained_messages: None,
+                pending: None,
             });
             thread.updated_at = Utc::now();
             self.store.save_thread(&thread)?;
@@ -7598,6 +7711,95 @@ impl RuntimeThreadManager {
             json!({ "thread": thread, "changes": { "session_id": session_id } }),
         )
         .await?;
+        Ok(())
+    }
+
+    /// Publish a native host snapshot and its Runtime cursor under the caller's
+    /// session_checkpoint_guard. Both TUI persistence and API saves use this
+    /// write-ahead boundary, including compaction which changes the old prefix.
+    pub(crate) async fn save_session_snapshot(
+        &self,
+        sessions: &crate::session_manager::SessionManager,
+        session: &crate::session_manager::SavedSession,
+        thread_id: Option<&str>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            session.metadata.runtime_store.as_ref() == Some(&self.session_store_binding()),
+            "Snapshot belongs to another Runtime owner"
+        );
+        let canonical = session.storage_compatible_copy();
+        let session = canonical.as_ref().unwrap_or(session);
+        let threads = match thread_id {
+            Some(id) => vec![self.store.load_thread(id)?],
+            None => self
+                .store
+                .list_threads()?
+                .into_iter()
+                .filter(|thread| {
+                    thread.session_id.as_deref() == Some(&session.metadata.id)
+                        && thread.task_id.is_none()
+                })
+                .collect(),
+        };
+        anyhow::ensure!(
+            threads.len() <= 1,
+            "Multiple Runtime threads claim this session"
+        );
+        let digest = session_messages_sha256(&session.messages)?;
+        for thread in &threads {
+            anyhow::ensure!(
+                !self
+                    .store
+                    .list_turns_for_thread(&thread.id)?
+                    .iter()
+                    .any(|turn| matches!(
+                        turn.status,
+                        RuntimeTurnStatus::Queued | RuntimeTurnStatus::InProgress
+                    )),
+                "Cannot publish a snapshot with queued or unfinished Runtime turns"
+            );
+            anyhow::ensure!(
+                !self.thread_has_active_turn(&thread.id).await,
+                "Cannot publish a snapshot while its Runtime thread is executing"
+            );
+            anyhow::ensure!(
+                thread
+                    .session_id
+                    .as_ref()
+                    .is_none_or(|id| id == &session.metadata.id),
+                "Runtime thread belongs to another saved session"
+            );
+            let _mutation = self.store.thread_mutation.lock();
+            let mut thread = self.store.load_thread(&thread.id)?;
+            thread.session_id = Some(session.metadata.id.clone());
+            let checkpoint =
+                thread
+                    .saved_session_checkpoint
+                    .get_or_insert_with(|| SavedSessionCheckpoint {
+                        covered_turn_id: None,
+                        messages_sha256: String::new(),
+                        message_count: None,
+                        retained_messages: None,
+                        pending: None,
+                    });
+            anyhow::ensure!(
+                checkpoint.retained_messages.is_none(),
+                "A retained-prefix fork must establish its own snapshot before host publication"
+            );
+            checkpoint.pending = Some(PendingSessionCheckpoint {
+                covered_turn_id: thread.latest_turn_id.clone(),
+                messages_sha256: digest.clone(),
+                message_count: session.messages.len(),
+            });
+            self.store.save_thread(&thread)?;
+        }
+        // A failed write leaves the old digest usable. A crash after the write
+        // leaves the pending digest usable; neither case bypasses validation.
+        sessions.save_session(session)?;
+        for thread in threads {
+            self.set_thread_session_checkpoint(&thread.id, session)
+                .await?;
+        }
         Ok(())
     }
 
@@ -7671,6 +7873,13 @@ impl RuntimeThreadManager {
 
     pub async fn fork_thread(&self, id: &str) -> Result<ThreadRecord> {
         let source = self.get_thread(id).await?;
+        anyhow::ensure!(
+            source
+                .saved_session_checkpoint
+                .as_ref()
+                .is_none_or(|checkpoint| checkpoint.pending.is_none()),
+            "Resume and save the pending native snapshot before forking"
+        );
         let mut forked = source.clone();
         let now = Utc::now();
         forked.id = format!("thr_{}", &Uuid::new_v4().to_string()[..8]);
@@ -7773,6 +7982,13 @@ impl RuntimeThreadManager {
         depth_from_tail: usize,
     ) -> Result<PreparedThreadFork> {
         let source = self.get_thread(id).await?;
+        anyhow::ensure!(
+            source
+                .saved_session_checkpoint
+                .as_ref()
+                .is_none_or(|checkpoint| checkpoint.pending.is_none()),
+            "Resume and save the pending native snapshot before forking"
+        );
         let source_turns = self.store.list_turns_for_thread(&source.id)?;
 
         // Walk turns from newest to oldest. For each turn, ask: does it
@@ -7850,6 +8066,11 @@ impl RuntimeThreadManager {
                     None => session_messages_sha256(&messages)?,
                 },
                 retained_messages: Some(retained_messages),
+                pending: None,
+                message_count: source
+                    .saved_session_checkpoint
+                    .as_ref()
+                    .and_then(|checkpoint| checkpoint.message_count),
             });
         }
 
@@ -10116,11 +10337,40 @@ impl RuntimeThreadManager {
                     crate::tools::goal::new_shared_goal_state(),
                 ),
             };
+            let todos = new_shared_todo_list();
+            let plan_state = new_shared_plan_state();
+            let work = if let Some(id) = thread.session_id.as_deref() {
+                let work =
+                    crate::work_graph::new_shared_work_runtime(todos.clone(), plan_state.clone());
+                let saved = match crate::session_manager::SessionManager::default_location()?
+                    .load_session(id)
+                {
+                    Ok(saved) => saved.work_state.unwrap_or_default(),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            && thread.saved_session_checkpoint.is_none() =>
+                    {
+                        Default::default()
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                work.restore_with_workspace_owner_bindings(
+                    id,
+                    &thread.workspace,
+                    saved.graph.as_ref(),
+                    &saved.todos,
+                    &saved.plan,
+                )
+                .map_err(anyhow::Error::msg)?;
+                Some(work)
+            } else {
+                None
+            };
             let engine_cfg = EngineConfig {
                 model: route_model.clone(),
                 active_route_limits: route_limits,
                 workspace: thread.workspace.clone(),
-                session_id: None,
+                session_id: thread.session_id.clone(),
                 subagent_state_root: None,
                 plugin_registry: thread_plugin_registry.clone(),
                 allow_shell: thread.allow_shell,
@@ -10153,8 +10403,8 @@ impl RuntimeThreadManager {
                 features: cfg.features(),
                 auto_review_policy: cfg.auto_review_policy(),
                 compaction,
-                todos: new_shared_todo_list(),
-                plan_state: new_shared_plan_state(),
+                todos,
+                plan_state,
                 goal_state,
                 max_spawn_depth: cfg.subagent_max_spawn_depth_for_provider(provider),
                 subagent_token_budget: cfg.subagent_token_budget_for_provider(provider),
@@ -10176,7 +10426,7 @@ impl RuntimeThreadManager {
                     } else {
                         Some(Arc::new(self.clone()))
                     },
-                    work: None,
+                    work,
                     shell_manager: None,
                     persist_services_enabled: false,
                     hook_executor: None,
@@ -10355,7 +10605,7 @@ impl RuntimeThreadManager {
         self.ensure_engine_loaded(&thread).await
     }
 
-    fn restore_thread_messages(&self, thread: &ThreadRecord) -> Result<Vec<Message>> {
+    pub(crate) fn restore_thread_messages(&self, thread: &ThreadRecord) -> Result<Vec<Message>> {
         let turns = self.store.list_turns_for_thread(&thread.id)?;
         let (mut messages, covered) = self
             .saved_session_prefix(thread, &turns)?
@@ -10377,12 +10627,50 @@ impl RuntimeThreadManager {
         };
         let session = crate::session_manager::default_sessions_dir()
             .and_then(crate::session_manager::SessionManager::new)
-            .and_then(|manager| manager.load_session(session_id))
-            .with_context(|| format!("Cannot read saved session {session_id}; restore that session file before resuming thread {}", thread.id))?;
-        let covered = if let Some(checkpoint) = &thread.saved_session_checkpoint {
+            .and_then(|manager| manager.load_session(session_id));
+        let session = match session {
+            Ok(session) => session,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                && thread.saved_session_checkpoint.is_none() && turns.is_empty() => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("Cannot read saved session {session_id}; restore that session file before resuming thread {}", thread.id)),
+        };
+        let mut resolved_checkpoint = thread.saved_session_checkpoint.clone();
+        if let Some(checkpoint) = resolved_checkpoint.as_mut()
+            && let Some(pending) = checkpoint.pending.as_ref()
+            && pending.messages_sha256 == session_messages_sha256(&session.messages)?
+            && pending.message_count == session.messages.len()
+        {
+            anyhow::ensure!(
+                checkpoint.retained_messages.is_none()
+                    && pending.covered_turn_id.as_deref()
+                        == turns.last().map(|turn| turn.id.as_str())
+                    && session.metadata.runtime_store.as_ref()
+                        == Some(&self.session_store_binding()),
+                "Pending native snapshot does not match its Runtime ownership or turn boundary"
+            );
+            checkpoint.messages_sha256 = pending.messages_sha256.clone();
+            checkpoint.message_count = Some(pending.message_count);
+            checkpoint.covered_turn_id = pending.covered_turn_id.clone();
+            checkpoint.pending = None;
+        }
+        let covered = if let Some(checkpoint) = &resolved_checkpoint {
             if checkpoint.messages_sha256 != session_messages_sha256(&session.messages)? {
-                bail!(
-                    "Saved session {session_id} changed after this thread's checkpoint; re-import it into a separate thread to preserve both histories"
+                // Another native host may have appended to this exact snapshot.
+                // Prove the old prefix, actual store ownership, and absence of
+                // uncheckpointed Runtime turns before accepting that advance.
+                let append_only = checkpoint.message_count.is_some_and(|count| {
+                    count <= session.messages.len()
+                        && session_messages_sha256(&session.messages[..count])
+                            .is_ok_and(|digest| digest == checkpoint.messages_sha256)
+                });
+                anyhow::ensure!(
+                    append_only
+                        && checkpoint.retained_messages.is_none()
+                        && checkpoint.covered_turn_id.as_deref()
+                            == turns.last().map(|turn| turn.id.as_str())
+                        && session.metadata.runtime_store.as_ref()
+                            == Some(&self.session_store_binding()),
+                    "Saved session {session_id} diverged from its Runtime checkpoint; preserve both records and resolve the conflict before continuing"
                 );
             }
             match checkpoint.covered_turn_id.as_deref() {

@@ -398,6 +398,25 @@ enum SessionsCommand {
         /// Search sessions by title
         #[arg(short, long)]
         search: Option<String>,
+        /// Emit the native session summary projection without starting a Runtime.
+        #[arg(long)]
+        json: bool,
+        /// Restrict listing to this workspace.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        include_archived: bool,
+        #[arg(long, default_value = "recent", value_parser = ["recent", "name", "size"])]
+        sort: String,
+    },
+    /// Read a full native saved snapshot as JSON without acquiring execution ownership.
+    Read { id: String },
+    /// Allocate a native identity without creating an empty saved conversation.
+    Allocate,
+    /// Inventory legacy desktop stores without importing or moving any history.
+    Inventory {
+        #[arg(long)]
+        task_root: PathBuf,
     },
     /// Export a session as a full-fidelity tar.xz archive (complete context:
     /// system prompt, messages, tool calls and results, plus artifacts)
@@ -2277,8 +2296,49 @@ async fn run_async_main_dispatch(
                 limit,
                 search,
             } => match command {
-                None => list_sessions(limit, search),
-                Some(SessionsCommand::List { limit, search }) => list_sessions(limit, search),
+                None => list_sessions(limit, search, false, None, false, "recent"),
+                Some(SessionsCommand::List {
+                    limit,
+                    search,
+                    json,
+                    workspace,
+                    include_archived,
+                    sort,
+                }) => list_sessions(
+                    limit,
+                    search,
+                    json,
+                    workspace.as_deref(),
+                    include_archived,
+                    &sort,
+                ),
+                Some(SessionsCommand::Read { id }) => {
+                    let session =
+                        session_manager::SessionManager::default_location()?.load_session(&id)?;
+                    let mut output = serde_json::to_value(&session)?;
+                    if let Some(messages) = output["messages"].as_array_mut() {
+                        for (value, message) in messages.iter_mut().zip(&session.messages) {
+                            value["display_user_prompt"] =
+                                serde_json::to_value(runtime_handoff::display_user_prompt(message))?;
+                        }
+                    }
+                    println!("{}", serde_json::to_string(&output)?);
+                    Ok(())
+                }
+                Some(SessionsCommand::Allocate) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({"id": uuid::Uuid::new_v4().to_string()})
+                    );
+                    Ok(())
+                }
+                Some(SessionsCommand::Inventory { task_root }) => {
+                    let records = runtime_threads::RuntimeThreadManager::legacy_runtime_inventory(
+                        &task_root,
+                    )?;
+                    println!("{}", serde_json::to_string_pretty(&records)?);
+                    Ok(())
+                }
                 Some(SessionsCommand::Export {
                     id,
                     output,
@@ -7909,7 +7969,14 @@ fn sessions_resume_command() -> &'static str {
     "codewhale resume"
 }
 
-fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
+fn list_sessions(
+    limit: usize,
+    search: Option<String>,
+    json: bool,
+    workspace: Option<&Path>,
+    include_archived: bool,
+    sort: &str,
+) -> Result<()> {
     use codewhale_palette as palette;
     use colored::Colorize;
     use session_manager::{SessionManager, format_session_line};
@@ -7921,11 +7988,29 @@ fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
 
     let manager = SessionManager::default_location()?;
 
-    let sessions = if let Some(query) = search {
-        manager.search_sessions(&query)?
-    } else {
-        manager.list_sessions()?
-    };
+    let all = manager.list_sessions()?;
+    let mut query = session_projection::SessionQuery::default()
+        .with_search(search.unwrap_or_default())
+        .with_filter(session_manager::SessionListFilter::from_query(
+            Some(include_archived),
+            None,
+        ))
+        .with_sort(session_projection::SessionSortMode::from_str_or_recent(
+            sort,
+        ))
+        .with_limit(if json { limit } else { usize::MAX });
+    if let Some(workspace) = workspace {
+        query = query.scoped_to(workspace);
+    }
+    let summaries = session_projection::project_sessions(&all, &query, None);
+    if json {
+        println!("{}", serde_json::to_string(&summaries)?);
+        return Ok(());
+    }
+    let sessions: Vec<_> = summaries
+        .iter()
+        .filter_map(|summary| all.iter().find(|metadata| metadata.id == summary.id))
+        .collect();
 
     if sessions.is_empty() {
         println!("{}", "No sessions found.".truecolor(sky_r, sky_g, sky_b));

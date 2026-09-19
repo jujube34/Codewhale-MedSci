@@ -104,12 +104,12 @@ use self::auth::{
     require_runtime_token, resolve_runtime_auth, runtime_auth_status_lines,
     runtime_request_is_authorized,
 };
+#[cfg(test)]
+use self::sessions::session_to_detail;
 use self::sessions::{
     create_session_from_thread, delete_session, get_session, list_sessions, list_sessions_summary,
     patch_session, resume_session_thread, save_current_session,
 };
-#[cfg(test)]
-use self::sessions::{messages_from_thread_detail, session_to_detail};
 #[cfg(test)]
 use self::workspace::collect_workspace_status;
 use self::workspace::{collect_workspace_git_metadata, workspace_file_search, workspace_status};
@@ -838,12 +838,41 @@ fn open_runtime_threads_for_server(
     // thread manager can spawn any of those engines, matching interactive and
     // headless exec startup.
     let workshop_activation = install_runtime_server_workshop_budgets(config);
-    let manager = Arc::new(RuntimeThreadManager::open_with_plugin_registry(
-        config.clone(),
-        workspace,
-        manager_config,
-        plugin_registry,
-    )?);
+    let manager = if let Some(id) = std::env::var_os("CODEWHALE_SESSION_ID") {
+        let id = id
+            .to_str()
+            .context("CODEWHALE_SESSION_ID must be Unicode")?;
+        anyhow::ensure!(
+            crate::runtime_threads::is_runtime_session_scope(id),
+            "Invalid native session ID"
+        );
+        let sessions = crate::session_manager::SessionManager::default_location()?;
+        let saved = match sessions.load_session(id) {
+            Ok(saved) => Some(saved),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let manager = RuntimeThreadManager::open_for_session(
+            config.clone(),
+            workspace,
+            RuntimeThreadManagerConfig::for_session(manager_config.task_data_dir, id),
+            plugin_registry,
+            saved
+                .as_ref()
+                .and_then(|session| session.metadata.runtime_store.as_ref()),
+        )?;
+        if saved.is_some() {
+            manager.load_owned_session(&sessions, id)?;
+        }
+        Arc::new(manager)
+    } else {
+        Arc::new(RuntimeThreadManager::open_with_plugin_registry(
+            config.clone(),
+            workspace,
+            manager_config,
+            plugin_registry,
+        )?)
+    };
     // Publish the same exact endpoint-scoped catalog as interactive startup
     // before the server admits turns. A cached model list alone does not make
     // its capabilities available to route resolution.
@@ -1142,7 +1171,6 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             )),
         )
         .route("/v1/threads", get(list_threads).post(create_thread))
-        .route("/v1/desktop/history", get(desktop_history))
         .route("/v1/threads/summary", get(list_threads_summary))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
         .route("/v1/threads/{id}/resume", post(resume_thread))
@@ -1624,21 +1652,6 @@ async fn list_threads(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(threads))
-}
-
-async fn desktop_history(
-    State(state): State<RuntimeApiState>,
-) -> Result<Json<Vec<Value>>, ApiError> {
-    if std::env::var("CODEWHALE_DESKTOP_SUPERVISED").as_deref() != Ok("1") {
-        return Err(ApiError::bad_request(
-            "Desktop history is only available to the desktop host",
-        ));
-    }
-    state
-        .runtime_threads
-        .desktop_history()
-        .map(Json)
-        .map_err(|e| ApiError::internal(e.to_string()))
 }
 
 async fn list_threads_summary(

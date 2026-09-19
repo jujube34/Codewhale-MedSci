@@ -981,6 +981,182 @@ fn ApiSettings(settings: Value, notice: RwSignal<String>) -> impl IntoView {
 }
 
 #[component]
+fn SessionBrowser(data: RwSignal<Value>, panel: RwSignal<String>) -> impl IntoView {
+    let sessions = RwSignal::new(Vec::<Value>::new());
+    let selected = RwSignal::new(String::new());
+    let preview = RwSignal::new(Value::Null);
+    let loading = RwSignal::new(true);
+    let preview_loading = RwSignal::new(false);
+    let failure = RwSignal::new(String::new());
+    let preview_failure = RwSignal::new(String::new());
+    let entering = RwSignal::new(false);
+    let request = RwSignal::new(0u64);
+    let retry = RwSignal::new(0u64);
+    let load = move || {
+        loading.set(true);
+        failure.set(String::new());
+        spawn_local(async move {
+            let result = call("conversations", json!({})).await;
+            if loading.try_get_untracked().is_none() {
+                return;
+            }
+            loading.set(false);
+            match result {
+                Ok(value) => {
+                    let rows = value.as_array().cloned().unwrap_or_default();
+                    let active = data.get_untracked()["session_id"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_owned();
+                    let id = rows
+                        .iter()
+                        .find(|row| row["id"] == active)
+                        .or(rows.first())
+                        .and_then(|row| row["id"].as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    sessions.set(rows);
+                    selected.set(id);
+                }
+                Err(error) => failure.set(error),
+            }
+        });
+    };
+    load();
+    Effect::new(move |_| {
+        let id = selected.get();
+        retry.get();
+        request.update(|value| *value += 1);
+        let token = request.get_untracked();
+        preview.set(Value::Null);
+        preview_failure.set(String::new());
+        preview_loading.set(!id.is_empty());
+        if id.is_empty() {
+            return;
+        }
+        spawn_local(async move {
+            let result = call("preview_conversation", json!({"id":id})).await;
+            // A slow response must not overwrite a newer selection or a closed dialog.
+            if request.try_get_untracked() != Some(token) {
+                return;
+            }
+            preview_loading.set(false);
+            match result {
+                Ok(value) => preview.set(value),
+                Err(error) => preview_failure.set(error),
+            }
+        });
+    });
+    let enter = move || {
+        let id = selected.get_untracked();
+        if id.is_empty() || entering.get_untracked() {
+            return;
+        }
+        entering.set(true);
+        failure.set(String::new());
+        spawn_local(async move {
+            let result = call("select_conversation", json!({"id":id})).await;
+            if entering.try_get_untracked().is_none() {
+                return;
+            }
+            match result {
+                Ok(_) => panel.set(String::new()),
+                Err(error) => {
+                    failure.try_set(error);
+                }
+            }
+            entering.try_set(false);
+        });
+    };
+    view! {
+        <h2>"当前目录的会话"</h2>
+        <div class="session-browser">
+            <nav class="session-list" aria-label="会话标题">
+                <Show when=move || loading.get()><p role="status">"正在读取会话…"</p></Show>
+                <Show when=move || !loading.get() && sessions.get().is_empty() && failure.get().is_empty()><p>"此目录暂无既往会话。"</p></Show>
+                {move || sessions.get().into_iter().map(|session| {
+                    let id = StoredValue::new(session["id"].as_str().unwrap_or("").to_owned());
+                    let title = session["title"].as_str().filter(|s| !s.is_empty()).unwrap_or("新会话").to_owned();
+                    let created = session["created_at"].as_str().and_then(|s| s.split('T').next()).filter(|s| !s.is_empty()).unwrap_or("日期未知");
+                    let count = session["message_count"].as_u64().map(|n| format!("{n} 条消息")).unwrap_or_else(|| "消息数未知".into());
+                    let model = session["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("模型未知");
+                    let metadata = format!("{created} · {count} · {model}");
+                    view! {
+                        <button class="session-entry" class:active=move || selected.get()==id.get_value()
+                            aria-pressed=move || selected.get()==id.get_value() title=title.clone()
+                            disabled=move || entering.get()
+                            on:click=move |_| selected.set(id.get_value())>
+                            <div class="session-entry-heading">
+                                <span>{title.clone()}</span>
+                                <small>{move || if data.get()["session_id"]==id.get_value() {"当前"} else {""}}</small>
+                            </div>
+                            <small class="session-entry-meta" title=format!("创建日期：{created} · {count} · 模型：{model}")>{metadata}</small>
+                        </button>
+                    }
+                }).collect_view()}
+            </nav>
+            <section class="session-preview" aria-label="会话内容预览" aria-busy=move || preview_loading.get()>
+                <Show when=move || selected.get().is_empty()><p class="session-placeholder">"选择左侧会话，查看已保存的内容。"</p></Show>
+                <Show when=move || preview_loading.get()><p role="status">"正在读取会话内容…"</p></Show>
+                <Show when=move || !preview_failure.get().is_empty()>
+                    <p role="alert">{move || preview_failure.get()}</p>
+                    <button on:click=move |_| retry.update(|value| *value+=1)>"重新读取"</button>
+                </Show>
+                {move || (!preview.get().is_null()).then(|| {
+                    let value = preview.get();
+                    let meta = &value["metadata"];
+                    let title = meta["title"].as_str().unwrap_or("新会话").to_owned();
+                    let updated = meta["updated_at"].as_str().unwrap_or("未知").to_owned();
+                    let model = meta["model"].as_str().unwrap_or("未知").to_owned();
+                    let count = meta["message_count"].as_u64().unwrap_or(0);
+                    let items = timeline(&value);
+                    view! {
+                        <header class="session-preview-header"><h3>{title}</h3>
+                            <p>{format!("更新时间：{updated}")}</p>
+                            <p>{format!("{count} 条消息 · 模型：{model}")}</p>
+                        </header>
+                        <div class="session-preview-content" tabindex="0" aria-label="已保存的会话内容">
+                            {if items.is_empty() { view! { <p>"该会话尚无已保存的消息。"</p> }.into_any() } else {
+                                items.into_iter().map(|item| match item {
+                                    TimelineItem::User(text) => view! { <article class="user"><div class="session-role">"用户"</div><div inner_html=markdown(&text)></div></article> }.into_any(),
+                                    TimelineItem::Answer(text) => view! { <div class="session-role">"助手"</div><Answer text=text/> }.into_any(),
+                                    TimelineItem::Reasoning { text, duration_ms, .. } => view! { <Reasoning text=text streaming=false duration_ms=duration_ms/> }.into_any(),
+                                    TimelineItem::Activity(activity) => view! { <Activity activity=activity/> }.into_any(),
+                                    TimelineItem::ActivityGroup(activities) => view! { <ActivityGroup activities=activities/> }.into_any(),
+                                    TimelineItem::FileMutation(file) => view! { <p>{format!("{} · {}",file.operation.label(),file.path)}</p><pre>{file.output}</pre> }.into_any(),
+                                    TimelineItem::SystemNotice(text) | TimelineItem::Error(text) => view! { <p>{text}</p> }.into_any(),
+                                    TimelineItem::Approval(_) | TimelineItem::UserInput(_) => view! { <p>"历史交互记录"</p> }.into_any(),
+                                }).collect_view().into_any()
+                            }}
+                        </div>
+                    }
+                })}
+            </section>
+        </div>
+        <Show when=move || !failure.get().is_empty()><p role="alert">{move || failure.get()}</p>
+            <Show when=move || sessions.get().is_empty()><button disabled=move || loading.get() on:click=move |_| load()>"重试"</button></Show>
+        </Show>
+        <div class="row session-actions">
+            <button disabled=move || entering.get() on:click=move |_| {
+                entering.set(true);
+                spawn_local(async move {
+                    let result = call("new_session",json!({})).await;
+                    if entering.try_get_untracked().is_none() { return; }
+                    match result {
+                        Ok(_) => panel.set(String::new()),
+                        Err(error) => { failure.try_set(error); }
+                    }
+                    entering.try_set(false);
+                });
+            }>"新建会话"</button>
+            <button class="primary" disabled=move || selected.get().is_empty() || preview_loading.get() || preview.get().is_null() || entering.get()
+                on:click=move |_| enter()>{move || if entering.get() {"正在进入…"} else {"进入会话"}}</button>
+            <button on:click=move |_| panel.set(String::new())>"关闭"</button>
+        </div>
+    }
+}
+
+#[component]
 fn App() -> impl IntoView {
     let data = RwSignal::new(
         json!({"messages":[],"cards":[],"settings":{"model":"deepseek-flash"},"status":"未启动"}),
@@ -993,8 +1169,21 @@ fn App() -> impl IntoView {
     let panel = RwSignal::new(String::new());
     let error = RwSignal::new(String::new());
     let notice = RwSignal::new(String::new());
-    let sessions = RwSignal::new(Vec::<Value>::new());
     let choosing_workspace = RwSignal::new(false);
+    let creating_session = RwSignal::new(false);
+    let create_session = move |_| {
+        if creating_session.get_untracked() {
+            return;
+        }
+        creating_session.set(true);
+        error.set(String::new());
+        spawn_local(async move {
+            if let Err(e) = call("new_session", json!({})).await {
+                error.set(e);
+            }
+            creating_session.set(false);
+        });
+    };
     let choose_workspace = move |_| {
         if choosing_workspace.get_untracked() {
             return;
@@ -1057,7 +1246,15 @@ fn App() -> impl IntoView {
     };
     view! {
     <div class="app">
-     <header class="titlebar" data-tauri-drag-region><button type="button" class="workspace" aria-label="切换工作目录" title=move||format!("{}\n点击切换工作目录",data.get()["workspace"].as_str().unwrap_or("未选择工作目录")) disabled=move||choosing_workspace.get() on:click=choose_workspace>{move||data.get()["workspace"].as_str().map(|path|path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().filter(|name|!name.is_empty()).unwrap_or(path)).unwrap_or("选择工作目录").to_owned()}</button><div class="window-controls"><button data-window="minimize" aria-label="最小化">"−"</button><button data-window="maximize" aria-label="最大化或还原">"□"</button><button data-window="close" aria-label="关闭">"×"</button></div></header>
+     <header class="titlebar" data-tauri-drag-region>
+      <button type="button" class="new-session-button" aria-label="新建会话" title="新建会话"
+        disabled=move || creating_session.get() || choosing_workspace.get() || sending.get()
+        on:click=create_session>
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <path d="M14 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8M16 4h6M19 1v6"/>
+        </svg>
+      </button>
+      <button type="button" class="workspace" aria-label="切换工作目录" title=move||format!("{}\n点击切换工作目录",data.get()["workspace"].as_str().unwrap_or("未选择工作目录")) disabled=move||choosing_workspace.get() on:click=choose_workspace>{move||data.get()["workspace"].as_str().map(|path|path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().filter(|name|!name.is_empty()).unwrap_or(path)).unwrap_or("选择工作目录").to_owned()}</button><div class="window-controls"><button data-window="minimize" aria-label="最小化">"−"</button><button data-window="maximize" aria-label="最大化或还原">"□"</button><button data-window="close" aria-label="关闭">"×"</button></div></header>
      <main aria-live="polite">
       {move || timeline(&data.get()).into_iter().map(|item| match item {
         TimelineItem::User(text) => view! { <article class="user"><div inner_html=markdown(&text)></div></article> }.into_any(),
@@ -1076,17 +1273,17 @@ fn App() -> impl IntoView {
      </main>
      <button id="back-to-latest" class="back-to-latest" type="button" hidden>"回到最新"</button>
      <div class="composer" on:input=move |_| {let refs: Value=serde_wasm_bindgen::from_value(references()).unwrap_or(json!([]));reference_count.set(refs.as_array().map_or(0,Vec::len));pasting.set(references_pending());}><div id="attachments" role="list" aria-label="本次任务引用的文件和文件夹"></div><div id="reference-notice" role="status"></div><div class="input-row"><textarea rows="1" aria-label="输入任务" placeholder=move||if data.get()["busy"].as_bool().unwrap_or(false){"补充指令，调整当前任务…"}else{"描述你的任务…"} prop:value=move||draft.get() on:input=move|e|draft.set(event_target_value(&e)) on:keydown=move|e|{if e.key()=="Enter" && !e.shift_key() && !e.is_composing(){e.prevent_default();submit();}}></textarea><button class="send" disabled=move||sending.get()||pasting.get()||(!has_content()&&!data.get()["busy"].as_bool().unwrap_or(false)) aria-label=move||if !has_content(){"停止"}else if data.get()["busy"].as_bool().unwrap_or(false){"发送补充指令"}else{"发送"} title=move||if !has_content(){"停止"}else if data.get()["busy"].as_bool().unwrap_or(false){"Steer 当前任务"}else{"发送"} on:click=move |_|{if !has_content(){action("stop",json!({}),error)}else{submit()}}>{move||if !has_content(){"■"}else if data.get()["busy"].as_bool().unwrap_or(false){"↗"}else{"↑"}}</button></div></div>
-     <footer><button on:click=open_api>{move||data.get()["settings"]["model"].as_str().unwrap_or("deepseek-flash").to_owned()}</button><button on:click=move |_|{panel.set("sessions".into());notice.set("正在读取…".into());spawn_local(async move {match call("conversations",json!({})).await {Ok(value)=>{sessions.set(value.as_array().cloned().unwrap_or_default());notice.set(String::new());},Err(e)=>notice.set(e)}})}>"会话"</button><span class="meter" title="本会话累计费用，按模型用量回执及价格表计算；≥ 表示仅部分调用可计价，实际结算以服务商账单为准。">{move||cost_label(&data.get())}</span><span class="meter" title="当前保留上下文的估算占用／模型上下文上限，按 1024 tokens = 1K；每轮结束后更新。">{move||context_label(&data.get())}</span><span class="spacer"></span><button on:click=open_api>{move||if data.get()["api_configured"].as_bool().unwrap_or(false){"API 已配置"}else{"配置 API"}}</button><button on:click=move |_|{notice.set(String::new());panel.set("login".into())}>"未登录"</button></footer>
+     <footer><button on:click=open_api>{move||data.get()["settings"]["model"].as_str().unwrap_or("deepseek-flash").to_owned()}</button><button on:click=move |_|{notice.set(String::new());panel.set("sessions".into());}>"会话"</button><span class="meter" title="本会话累计费用，按模型用量回执及价格表计算；≥ 表示仅部分调用可计价，实际结算以服务商账单为准。">{move||cost_label(&data.get())}</span><span class="meter" title="当前保留上下文的估算占用／模型上下文上限，按 1024 tokens = 1K；每轮结束后更新。">{move||context_label(&data.get())}</span><span class="spacer"></span><button on:click=open_api>{move||if data.get()["api_configured"].as_bool().unwrap_or(false){"API 已配置"}else{"配置 API"}}</button><button on:click=move |_|{notice.set(String::new());panel.set("login".into())}>"未登录"</button></footer>
     </div>
     <Show when=move||!panel.get().is_empty()>
-    <div class="overlay" on:keydown=move|e|{if e.key()=="Escape"{panel.set(String::new());}}><section class=move||if panel.get()=="login"{"dialog login"}else if panel.get()=="api"{"dialog api-dialog"}else{"dialog"} role="dialog" aria-modal="true" aria-label="设置">
-    <Show when=move||panel.get()=="sessions"><h2>"当前目录的会话"</h2><div class="session-list">{move||sessions.get().into_iter().map(|session|{let id=session["id"].as_str().unwrap_or("").to_owned();let store=session["store"].as_str().unwrap_or("legacy").to_owned();let active=id==data.get()["session_id"].as_str().unwrap_or("");let title=session["title"].as_str().unwrap_or("新会话").to_owned();view!{<button class=if active{"session-entry active"}else{"session-entry"} on:click=move |_|{let id=id.clone();let store=store.clone();spawn_local(async move{match call("select_conversation",json!({"id":id,"store":store})).await{Ok(_)=>panel.set(String::new()),Err(e)=>notice.set(e)}})}><span>{title}</span><small>{if active{"当前"}else{""}}</small></button>}}).collect_view()}</div><Show when=move||sessions.get().is_empty()&&notice.get().is_empty()><p>"此目录暂无既往会话。"</p></Show><div class="row"><button class="primary" on:click=move |_|spawn_local(async move{match call("new_session",json!({})).await{Ok(_)=>panel.set(String::new()),Err(e)=>notice.set(e)}})>"新建会话"</button></div></Show>
+    <div class="overlay" on:keydown=move|e|{if e.key()=="Escape"{panel.set(String::new());}}><section class=move||if panel.get()=="login"{"dialog login"}else if panel.get()=="api"{"dialog api-dialog"}else if panel.get()=="sessions"{"dialog sessions-dialog"}else{"dialog"} role="dialog" aria-modal="true" aria-label=move||if panel.get()=="sessions"{"会话浏览与选择"}else{"设置"}>
+    <Show when=move||panel.get()=="sessions"><SessionBrowser data=data panel=panel/></Show>
     <Show when=move||panel.get()=="api"><ApiSettings settings=data.get()["settings"].clone() notice=notice/></Show>
     <Show when=move||panel.get()=="login"><h2>"公司账号"</h2><p>"公司认证服务尚未接入，不影响使用个人 API 密钥测试。"</p><label for="account">"公司账号"</label><input id="account" autocomplete="username"/><label for="password">"密码"</label><input id="password" type="password" autocomplete="off"/><div class="row"><button class="primary" on:click=move |_|spawn_local(async move{if let Err(e)=call("company_login",json!({})).await{notice.set(e)}})>"登录"</button></div></Show>
     <Show when=move||panel.get()=="permissions"><h2>"工作区与权限"</h2><p>"Full Access 已启用：Agent 可执行命令、访问网络及读写当前系统用户有权限访问的文件，不再等待操作审批。"</p><p>{move||data.get()["workspace"].as_str().unwrap_or("未选择工作区").to_owned()}</p><p>"此开发预览默认禁用 MCP Registry；本地工具优先。"</p></Show>
     <Show when=move||panel.get()=="network"><h2>"网络连接"</h2><p>"当前构建使用仅直连模式。系统代理、PAC 自动回退和手动代理正在开发，尚不能作为已通过验收的功能。"</p><button on:click=move |_|spawn_local(async move{notice.set(match call("test_api",json!({})).await{Ok(v)=>v.as_str().unwrap_or("").into(),Err(e)=>e})})>"测试已保存配置"</button></Show>
     <Show when=move||panel.get()=="agent"><h2>"Agent 与运行环境"</h2><p>"Codewhale 0.9.13 · stdio JSON-RPC · 本地 SQLite 会话"</p><p>{move||format!("共享 Python：{}",data.get()["python"].as_str().unwrap_or("未初始化"))}</p><button on:click=move |_|spawn_local(async move{notice.set("正在初始化，请稍候…".into());notice.set(match call("initialize_python",json!({})).await{Ok(v)=>v.as_str().unwrap_or("").into(),Err(e)=>e})})>"初始化共享 Python"</button><p>"当前版本会话可恢复 Agent 历史；旧版本仅保存的文字记录不含 Runtime 推理上下文。"</p><button on:click=move |_|action("restart",json!({}),error)>"重启 Agent"</button></Show>
-    <Show when=move||!notice.get().is_empty()><p role="status">{move||notice.get()}</p></Show><div class="row"><button on:click=move |_|{panel.set(String::new());notice.set(String::new());}>"关闭"</button></div>
+    <Show when=move||!notice.get().is_empty()><p role="status">{move||notice.get()}</p></Show><Show when=move||panel.get()!="sessions"><div class="row"><button on:click=move |_|{panel.set(String::new());notice.set(String::new());}>"关闭"</button></div></Show>
     </section></div></Show>
     <Show when=move||data.get()["pending_workspace"].is_string()><div class="overlay"><section class="dialog" role="alertdialog" aria-modal="true"><h2>"切换工作区？"</h2><p>"当前任务正在执行。切换将停止任务并保存已有消息。"</p><div class="row"><button on:click=move |_|action("resolve_switch",json!({"allow":false}),error)>"取消"</button><button on:click=move |_|action("resolve_switch",json!({"allow":true}),error)>"停止并切换"</button></div></section></div></Show>
     }

@@ -1117,19 +1117,7 @@ pub(crate) fn build_session_snapshot(
         .as_ref()
         .and_then(|tasks| tasks.session_store_binding())
     {
-        if session
-            .metadata
-            .runtime_store
-            .as_ref()
-            .is_some_and(|saved| {
-                saved != &binding && !saved.is_missing_session_store().unwrap_or(false)
-            })
-        {
-            return Err(
-                "session snapshot refused to replace its saved Runtime store ownership".into(),
-            );
-        }
-        session.metadata.runtime_store = Some(binding);
+        session.bind_runtime_store(binding)?;
     }
     // Title resolution, in priority order:
     // 1. Disk, when the session already exists (#2934/#4397: a rename applied

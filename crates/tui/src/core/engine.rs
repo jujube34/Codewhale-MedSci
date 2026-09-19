@@ -3035,20 +3035,15 @@ impl Engine {
                                 );
                             }
                         }
-                        let compaction_checkpoint =
+                        let legacy_compaction_checkpoint =
                             extract_compaction_summary_prompt(system_prompt.clone());
                         let mut restored_messages =
                             crate::runtime_handoff::project_messages_for_restore(&messages);
-                        // The persisted carrier is authoritative for the one
-                        // history checkpoint. Drop stale projected copies so
-                        // repeated reloads cannot stack or retain an older one.
-                        restored_messages.retain(|message| {
-                            !crate::compaction::is_compaction_checkpoint_message(message)
-                        });
-                        if let Some(checkpoint) = compaction_checkpoint.as_ref() {
-                            restored_messages
-                                .push(crate::compaction::compaction_checkpoint_message(checkpoint));
-                        }
+                        let compaction_checkpoint =
+                            crate::compaction::restore_compaction_checkpoint(
+                                &mut restored_messages,
+                                legacy_compaction_checkpoint,
+                            );
                         self.session.messages = restored_messages.into();
                         // Direct field assignment bypasses `add_message` /
                         // `replace_messages`, which own the messages-revision
@@ -3127,11 +3122,15 @@ impl Engine {
                         self.finish_compaction(&id);
                     }
                     Op::GetSessionSnapshot { tx } => {
-                        let total_tokens = self.session.total_usage.input_tokens
-                            + self.session.total_usage.output_tokens;
                         let snapshot = SessionSnapshot {
+                            work_state: self.config.runtime_services.work.as_ref().map_or(
+                                Ok(None),
+                                |work| {
+                                    work.capture(Some(&self.session.id))
+                                        .map(|state| state.map(Into::into))
+                                },
+                            ),
                             messages: self.session.messages.to_vec(),
-                            total_tokens,
                             model: self.session.model.clone(),
                             model_provider: self.api_provider.as_str().to_string(),
                             model_provider_id: self.api_provider_id.clone(),
