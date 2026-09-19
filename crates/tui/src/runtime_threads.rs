@@ -2298,8 +2298,14 @@ impl RuntimeThreadStore {
     }
 
     pub fn list_threads(&self) -> Result<Vec<ThreadRecord>> {
+        Self::list_threads_in(&self.threads_dir)
+    }
+
+    // Read-only discovery must not open a store: open performs recovery and
+    // belongs exclusively to the Runtime process holding its owner lease.
+    fn list_threads_in(directory: &Path) -> Result<Vec<ThreadRecord>> {
         let mut out = Vec::new();
-        let threads_dir = checked_existing_runtime_store_dir(&self.threads_dir)?;
+        let threads_dir = checked_existing_runtime_store_dir(directory)?;
         for entry in fs::read_dir(&threads_dir)
             .with_context(|| format!("Failed to read {}", threads_dir.display()))?
         {
@@ -4755,6 +4761,55 @@ impl RuntimeThreadManager {
                 .to_path_buf(),
             execution_scope: self.task_execution_identity().0,
         }
+    }
+
+    /// Native desktop history across isolated Runtime stores, including the
+    /// pre-multi-instance store. No GUI database or copied conversation data.
+    pub(crate) fn desktop_history(&self) -> Result<Vec<Value>> {
+        let root = &self.manager_cfg.task_data_dir;
+        let mut stores = vec![("legacy".to_string(), root.join("runtime"))];
+        let desktop = root.join("desktop");
+        if desktop.exists() {
+            for entry in fs::read_dir(checked_existing_runtime_store_dir(&desktop)?)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    stores.push((
+                        entry.file_name().to_string_lossy().into_owned(),
+                        entry.path(),
+                    ));
+                }
+            }
+        }
+        let mut history = Vec::new();
+        for (scope, store) in stores {
+            let threads = store.join("threads");
+            if !threads.exists() {
+                continue;
+            }
+            for thread in RuntimeThreadStore::list_threads_in(&threads)? {
+                if thread.archived {
+                    continue;
+                }
+                let mut title = thread.title.clone().filter(|v| !v.is_empty());
+                if title.is_none()
+                    && let Some(turn_id) = &thread.latest_turn_id
+                {
+                    validated_record_id(turn_id, "turn id")?;
+                    let path = store.join("turns").join(format!("{turn_id}.json"));
+                    let turn: TurnRecord = serde_json::from_str(&read_store_file(&path)?)?;
+                    turn.validate_output_token_limit()?;
+                    anyhow::ensure!(
+                        turn.thread_id == thread.id,
+                        "History turn belongs to another thread"
+                    );
+                    title = Some(turn.input_summary);
+                }
+                history.push(json!({"id":thread.id,"title":title,
+                    "updated":thread.updated_at,"workspace":thread.workspace,"store":scope}));
+            }
+        }
+        history.sort_by(|a, b| b["updated"].as_str().cmp(&a["updated"].as_str()));
+        Ok(history)
     }
 
     pub(crate) async fn close_execution_admission(&self) {

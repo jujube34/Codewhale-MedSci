@@ -48,15 +48,21 @@ def install_runtime_dlls(env):
         if digest(source/name)!=sha: raise RuntimeError('C++ runtime 校验失败: '+name)
         shutil.copyfile(source/name,env/'Scripts'/name)
 @contextlib.contextmanager
-def locked(home):
+def locked(home, name='transaction.lock'):
     home.mkdir(parents=True,exist_ok=True)
-    with (home/'transaction.lock').open('a+b') as f:
-        if os.name=='nt':
-            import msvcrt
-            f.seek(0);f.write(b'0');f.flush();f.seek(0);msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1)
-        else:
-            import fcntl
-            fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    with (home/name).open('a+b') as f:
+        try:
+            if os.name=='nt':
+                import msvcrt
+                # Never write through another process's shared usage lock.
+                f.seek(0);msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1)
+            else:
+                import fcntl
+                fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in (11,13) or getattr(error,'winerror',None) in (32,33):
+                raise RuntimeError('共享 Python 正被其他窗口使用或更新，请关闭相关窗口后重试') from error
+            raise
         yield
 
 def smoke(python):
@@ -72,7 +78,7 @@ def recover(home):
 def transact(home, package=None):
     global LOG_DIR
     LOG_DIR=home/'logs'
-    with locked(home):
+    with locked(home), locked(home, 'usage.lock'):
         recover(home)
         current=home/'current'
         previous={}

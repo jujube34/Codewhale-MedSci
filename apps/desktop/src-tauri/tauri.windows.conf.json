@@ -1,0 +1,17 @@
+{
+  "app": {
+    "windows": [{
+      "label": "main",
+      "create": false,
+      "title": "",
+      "width": 1120,
+      "height": 800,
+      "minWidth": 640,
+      "minHeight": 480,
+      "decorations": false,
+      "shadow": false,
+      "transparent": true,
+      "backgroundColor": "#00000000"
+    }]
+  }
+}

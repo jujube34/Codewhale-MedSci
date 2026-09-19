@@ -1,9 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod agent;
+mod file_references;
 use agent::Agent;
+use codewhale_config::{ProviderKind, catalog::bundled_models_dev_catalog};
+use file_references::{FileReference, clipboard_file_references, resolve_file_references};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    fs::{File, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -17,13 +22,17 @@ struct Settings {
     schema_version: u32,
     base_url: String,
     model: String,
+    provider: String,
+    reasoning_effort: String,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             base_url: "https://api.deepseek.com".into(),
             model: "deepseek-flash".into(),
+            provider: "deepseek".into(),
+            reasoning_effort: "auto".into(),
         }
     }
 }
@@ -33,6 +42,10 @@ struct Message {
     sequence: u64,
     role: String,
     text: String,
+    #[serde(default)]
+    streaming: bool,
+    #[serde(default)]
+    duration_ms: Option<u64>,
 }
 #[derive(Clone, Serialize)]
 struct Snapshot {
@@ -56,21 +69,107 @@ struct Inner {
     thread: Option<String>,
     generation: u64,
     stop_requested: bool,
+    credentials_changed: bool,
+    runtime: Option<RuntimeScope>,
+}
+struct RuntimeScope {
+    path: PathBuf,
+    _lease: File,
 }
 struct Desktop {
     inner: Arc<Mutex<Inner>>,
     home: PathBuf,
     resources: PathBuf,
     runtime_transaction: Mutex<()>,
+    key_edits: Mutex<std::collections::HashMap<String, u64>>,
+    instance: tempfile::TempDir,
+    session_transition: Mutex<()>,
 }
-fn credential() -> Result<keyring::Entry, String> {
-    keyring::Entry::new("com.medsci.codewhale", "deepseek")
+impl Desktop {
+    fn begin_transition(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+        self.session_transition
+            .try_lock()
+            .map_err(|_| "会话正在切换，请稍后重试".into())
+    }
+}
+// Locks live outside ephemeral instance directories. Never unlink a lock file:
+// another process may already hold an open handle to it.
+fn open_lock(path: &Path) -> Result<File, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| e.to_string())
+}
+fn claim_runtime(home: &Path, id: &str) -> Result<RuntimeScope, String> {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err("无效会话 ID".into());
+    }
+    let tasks = home.join("agent/tasks");
+    let parent = if id == "legacy" {
+        tasks.clone()
+    } else {
+        tasks.join("desktop")
+    };
+    let path = parent
+        .join(if id == "legacy" { "runtime" } else { id })
+        .canonicalize()
+        .map_err(|_| "会话存储不存在".to_string())?;
+    if !path.starts_with(parent.canonicalize().map_err(|e| e.to_string())?) {
+        return Err("会话存储路径无效".into());
+    }
+    let file = open_lock(&path.join("desktop-owner.lock"))?;
+    file.try_lock()
+        .map_err(|_| "此会话已在另一个窗口打开，请先在该窗口切换会话或关闭窗口".to_string())?;
+    Ok(RuntimeScope { path, _lease: file })
+}
+fn new_runtime(home: &Path) -> Result<RuntimeScope, String> {
+    let root = home.join("agent/tasks/desktop");
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    // Persistent native history, deliberately separate from instance scratch.
+    let path = tempfile::Builder::new()
+        .prefix("session-")
+        .tempdir_in(root)
+        .map_err(|e| e.to_string())?
+        .keep();
+    claim_runtime(
+        home,
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("会话路径无效")?,
+    )
+}
+fn save_settings(home: &Path, settings: &Settings) -> Result<(), String> {
+    let lock = open_lock(&home.join("settings.lock"))?;
+    lock.try_lock()
+        .map_err(|_| "另一个窗口正在保存设置，请重试".to_string())?;
+    let mut temp = tempfile::NamedTempFile::new_in(home).map_err(|e| e.to_string())?;
+    temp.write_all(&serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    // persist replaces atomically on Windows as well as Unix. Last successful
+    // save becomes the default for future windows; existing snapshots stay put.
+    temp.persist(home.join("settings.json"))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+fn credential(provider: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new("com.medsci.codewhale", provider)
         .map_err(|_| "无法访问系统安全凭据库".into())
 }
-fn key() -> Result<String, String> {
-    credential()?
+fn key(provider: &str) -> Result<String, String> {
+    credential(provider)?
         .get_password()
-        .map_err(|_| "请先配置 DeepSeek API 密钥".into())
+        .map_err(|_| "请先配置当前服务商的 API 密钥".into())
 }
 fn canonical(path: &str) -> Result<PathBuf, String> {
     let p = Path::new(path);
@@ -93,7 +192,128 @@ fn official(base: &str) -> bool {
             | "https://api.deepseek.com/beta"
     )
 }
+fn api_providers() -> Vec<ProviderKind> {
+    use codewhale_config::provider::CredentialAcquisition;
+    ProviderKind::all()
+        .iter()
+        .copied()
+        .filter(|kind| {
+            let p = kind.provider();
+            matches!(
+                p.credential_help().acquisition,
+                CredentialAcquisition::ApiKey | CredentialAcquisition::ApiKeyOrOAuth
+            ) && p.default_base_url().starts_with("https://")
+                && !p.env_vars().is_empty()
+        })
+        .collect()
+}
+
+// Read the same provider-scoped catalog as the TUI. Unknown/custom routes keep
+// automatic control rather than inheriting another endpoint's capabilities.
+fn effort_options(provider: ProviderKind, base: &str, model: &str) -> Vec<&'static str> {
+    let mut efforts = vec!["auto"];
+    let native = provider.provider();
+    let base = base.trim().trim_end_matches('/');
+    let same_endpoint = base == native.default_base_url().trim_end_matches('/')
+        || (provider == ProviderKind::Deepseek && official(base))
+        || (provider == ProviderKind::Moonshot
+            && matches!(
+                base,
+                "https://api.moonshot.cn/v1" | "https://api.moonshot.ai/v1"
+            ))
+        || (provider == ProviderKind::Zai
+            && matches!(
+                base,
+                "https://api.z.ai/api/paas/v4"
+                    | "https://api.z.ai/api/coding/paas/v4"
+                    | "https://open.bigmodel.cn/api/paas/v4"
+                    | "https://open.bigmodel.cn/api/coding/paas/v4"
+            ));
+    if !same_endpoint {
+        return efforts;
+    }
+    let catalog = bundled_models_dev_catalog();
+    let Some(row) = catalog.provider_model(provider.as_str(), model) else {
+        return efforts;
+    };
+    if row.reasoning != Some(true) {
+        return efforts;
+    }
+    // Native Z.ai request shaping overrides the older bundled tier metadata.
+    // See TUI config::is_exact_zai_forced_thinking_route: 5.3 rejects off.
+    if provider == ProviderKind::Zai {
+        match model.to_ascii_lowercase().as_str() {
+            "glm-5.3" | "glm-5.3-flash" => return vec!["auto", "high", "max"],
+            "glm-5.2" => return vec!["auto", "off", "high", "max"],
+            "glm-5-turbo" => return vec!["auto", "off", "high"],
+            _ => {}
+        }
+    }
+    for option in &row.reasoning_options {
+        if option["type"] != "effort" && option["type"] != "thinking" {
+            continue;
+        }
+        if let Some(values) = option["values"].as_array() {
+            for raw in values.iter().filter_map(Value::as_str) {
+                let value = match raw {
+                    "off" | "none" | "disabled" => "off",
+                    "enabled" => "high",
+                    "minimal" => "minimal",
+                    "low" => "low",
+                    "medium" => "medium",
+                    "high" => "high",
+                    "xhigh" => "xhigh",
+                    "max" => "max",
+                    "ultra" => "ultra",
+                    _ => continue,
+                };
+                if !efforts.contains(&value) {
+                    efforts.push(value);
+                }
+            }
+        }
+    }
+    if efforts.len() == 1 {
+        match provider {
+            ProviderKind::Deepseek => efforts.extend(["off", "low", "high", "max"]),
+            ProviderKind::Moonshot if model == "kimi-k3" => efforts.extend(["low", "high", "max"]),
+            ProviderKind::Moonshot => efforts.extend(["off", "high"]),
+            _ => {}
+        }
+    }
+    efforts
+}
+
+#[tauri::command]
+fn api_catalog() -> Value {
+    let catalog = bundled_models_dev_catalog();
+    json!(api_providers().into_iter().map(|kind| {
+        let p = kind.provider();
+        let mut models: Vec<Value> = catalog.provider(kind.as_str()).map(|row| row.models.iter()
+            .filter(|(_, model)| model.supports_text_chat() && model.tool_call != Some(false))
+            .map(|(id, model)| json!({"id":id,"name":model.name.as_deref().unwrap_or(id),"efforts":effort_options(kind,p.default_base_url(),id)}))
+            .collect()).unwrap_or_default();
+        if !models.iter().any(|m| m["id"] == p.default_model()) {
+            models.insert(0, json!({"id":p.default_model(),"name":p.default_model(),"efforts":["auto"]}));
+        }
+        json!({"id":kind.as_str(),"name":p.display_name(),"base_url":p.default_base_url(),"model":p.default_model(),"models":models})
+    }).collect::<Vec<_>>())
+}
+
+#[tauri::command]
+fn api_efforts(provider: String, base_url: String, model: String) -> Vec<&'static str> {
+    ProviderKind::parse(&provider)
+        .map(|p| effort_options(p, &base_url, &model))
+        .unwrap_or_else(|| vec!["auto"])
+}
+
 fn validate_settings(mut s: Settings) -> Result<Settings, String> {
+    let provider = ProviderKind::parse(&s.provider)
+        .filter(|p| api_providers().contains(p))
+        .ok_or("不支持的 API 服务商")?;
+    s.provider = provider.as_str().into();
+    s.base_url = s.base_url.trim().to_string();
+    s.model = s.model.trim().to_string();
     let u = url::Url::parse(&s.base_url).map_err(|_| "API 地址无效".to_string())?;
     if u.scheme() != "https"
         || !u.username().is_empty()
@@ -106,7 +326,8 @@ fn validate_settings(mut s: Settings) -> Result<Settings, String> {
     if s.model.trim().is_empty() || s.model.len() > 200 {
         return Err("模型名称无效".into());
     }
-    if official(&s.base_url)
+    if provider == ProviderKind::Deepseek
+        && official(&s.base_url)
         && matches!(
             s.model.as_str(),
             "deepseek-v4-flash" | "deepseek-v4-flash-vision-exp"
@@ -114,7 +335,10 @@ fn validate_settings(mut s: Settings) -> Result<Settings, String> {
     {
         s.model = "deepseek-flash".into()
     }
-    s.schema_version = 1;
+    if !effort_options(provider, &s.base_url, &s.model).contains(&s.reasoning_effort.as_str()) {
+        return Err("当前模型或 API 地址不支持所选思考强度，请重新选择".into());
+    }
+    s.schema_version = 2;
     Ok(s)
 }
 fn redact(text: &str, secret: &str) -> String {
@@ -143,10 +367,10 @@ fn redact(text: &str, secret: &str) -> String {
 }
 // Launchpad supplies no workspace. Resolve the OS user home, never the
 // process working directory; an invalid explicit path must not widen access.
-fn startup_workspace(explicit: Option<&str>, user_home: &Path) -> Result<String, String> {
+fn startup_workspace(explicit: Option<&str>, launch_dir: &Path) -> Result<String, String> {
     let path = explicit
         .map(PathBuf::from)
-        .unwrap_or_else(|| user_home.to_path_buf());
+        .unwrap_or_else(|| launch_dir.to_path_buf());
     canonical(&path.to_string_lossy()).map(|p| p.to_string_lossy().into_owned())
 }
 fn next_message_sequence(view: &Snapshot) -> u64 {
@@ -163,6 +387,79 @@ fn next_message_sequence(view: &Snapshot) -> u64 {
         .unwrap_or(0)
         .saturating_add(1)
 }
+fn item_duration_ms(item: &Value) -> Option<u64> {
+    let started = chrono::DateTime::parse_from_rfc3339(item["started_at"].as_str()?).ok()?;
+    let ended = chrono::DateTime::parse_from_rfc3339(item["ended_at"].as_str()?).ok()?;
+    u64::try_from((ended - started).num_milliseconds()).ok()
+}
+fn item_card_id(card: &Value) -> Option<&str> {
+    card["item_id"]
+        .as_str()
+        .or(card.pointer("/payload/item/id").and_then(Value::as_str))
+        .or(card
+            .pointer("/payload/item/metadata/tool_use_id")
+            .and_then(Value::as_str))
+        .or(card.pointer("/payload/tool/id").and_then(Value::as_str))
+}
+fn is_timeline_item(card: &Value) -> bool {
+    matches!(
+        card.pointer("/payload/item/kind").and_then(Value::as_str),
+        Some(
+            "tool_call"
+                | "command_execution"
+                | "file_change"
+                | "context_compaction"
+                | "status"
+                | "error"
+        )
+    ) || card.pointer("/payload/tool").is_some_and(Value::is_object)
+}
+fn record_timeline_card(view: &mut Snapshot, event: &Value) {
+    let name = event["event"].as_str().unwrap_or("");
+    if matches!(name, "approval.required" | "user_input.required") {
+        let mut card = event.clone();
+        card["sequence"] = json!(next_message_sequence(view));
+        view.cards.push(card);
+    } else if matches!(
+        name,
+        "item.started" | "item.completed" | "item.failed" | "item.interrupted" | "item.canceled"
+    ) && is_timeline_item(event)
+    {
+        let existing = item_card_id(event).and_then(|id| {
+            view.cards
+                .iter()
+                .position(|card| item_card_id(card) == Some(id))
+        });
+        let sequence = existing
+            .and_then(|index| view.cards[index]["sequence"].as_u64())
+            .unwrap_or_else(|| next_message_sequence(view));
+        let previous_tool = existing.and_then(|index| {
+            view.cards[index]
+                .pointer("/payload/tool")
+                .filter(|tool| tool.is_object())
+                .cloned()
+        });
+        let mut card = event.clone();
+        card["sequence"] = json!(sequence);
+        if let Some(payload) = card["payload"].as_object_mut() {
+            payload.remove("arguments");
+            payload.remove("output");
+            if !payload.get("tool").is_some_and(Value::is_object)
+                && let Some(tool) = previous_tool
+            {
+                payload.insert("tool".into(), tool);
+            }
+        }
+        if let Some(index) = existing {
+            view.cards[index] = card;
+        } else {
+            view.cards.push(card);
+        }
+    }
+    if view.cards.len() > 100 {
+        view.cards.remove(0);
+    }
+}
 // Runtime emits reasoning sequentially: start, deltas, completion before the next item.
 fn append_stream(messages: &mut Vec<Message>, sequence: u64, role: &str, text: &str) {
     if let Some(message) = messages.last_mut() {
@@ -175,6 +472,8 @@ fn append_stream(messages: &mut Vec<Message>, sequence: u64, role: &str, text: &
         sequence,
         role: role.into(),
         text: text.into(),
+        streaming: role == "reasoning",
+        duration_ms: None,
     });
 }
 fn reasoning_event(messages: &mut Vec<Message>, sequence: u64, event: &Value) -> bool {
@@ -187,6 +486,8 @@ fn reasoning_event(messages: &mut Vec<Message>, sequence: u64, event: &Value) ->
             sequence,
             role: "reasoning".into(),
             text: payload["item"]["detail"].as_str().unwrap_or("").into(),
+            streaming: true,
+            duration_ms: None,
         }),
         "item.delta" => append_stream(
             messages,
@@ -198,8 +499,14 @@ fn reasoning_event(messages: &mut Vec<Message>, sequence: u64, event: &Value) ->
             if let Some(text) = payload["item"]["detail"].as_str() {
                 if let Some(message) = messages.iter_mut().rev().find(|m| m.role == "reasoning") {
                     message.text = text.into();
+                    message.streaming = false;
+                    message.duration_ms = item_duration_ms(&payload["item"]);
                 } else {
                     append_stream(messages, sequence, "reasoning", text);
+                    if let Some(message) = messages.last_mut() {
+                        message.streaming = false;
+                        message.duration_ms = item_duration_ms(&payload["item"]);
+                    }
                 }
             }
         }
@@ -241,19 +548,40 @@ fn apply_session(view: &mut Snapshot, session: &Value) -> Result<(), String> {
                     .or(item["summary"].as_str())
                     .unwrap_or("")
                     .into(),
+                streaming: item["status"] == "in_progress",
+                duration_ms: item_duration_ms(item),
             });
-        } else {
-            let metadata = &item["metadata"];
-            if let Some(name) = metadata["tool_name"].as_str() {
-                view.cards.push(json!({"sequence":sequence,"event":"item.started","payload":{"item":item,"tool":{"id":metadata["tool_use_id"],"name":name,"input":metadata["tool_input"]}}}));
-            }
+        } else if matches!(
+            item["kind"].as_str(),
+            Some(
+                "tool_call"
+                    | "command_execution"
+                    | "file_change"
+                    | "context_compaction"
+                    | "status"
+                    | "error"
+            )
+        ) {
+            let event = match item["status"].as_str().unwrap_or("") {
+                "failed" => "item.failed",
+                "interrupted" | "canceled" => "item.interrupted",
+                "in_progress" | "queued" => "item.started",
+                _ => "item.completed",
+            };
+            view.cards.push(
+                json!({"sequence":sequence,"event":event,"item_id":item["id"],"payload":{"item":item}}),
+            );
         }
     }
     Ok(())
 }
 #[tauri::command]
 async fn conversations(state: State<'_, Desktop>) -> Result<Value, String> {
-    let (a, thread, _) = ensure_agent(&state).await?;
+    let _transition = state.begin_transition()?;
+    list_conversations(&state).await
+}
+async fn list_conversations(state: &Desktop) -> Result<Value, String> {
+    let (a, thread, _) = ensure_agent(state).await?;
     a.request(
         "desktop/session",
         json!({"thread_id":thread,"operation":"list"}),
@@ -261,38 +589,76 @@ async fn conversations(state: State<'_, Desktop>) -> Result<Value, String> {
     .await
 }
 #[tauri::command]
-async fn select_conversation(state: State<'_, Desktop>, id: String) -> Result<(), String> {
-    stop_internal(&state).await?;
-    let (a, thread, generation) = ensure_agent(&state).await?;
-    let session = a
-        .request(
-            "desktop/session",
-            json!({"thread_id":thread,"runtime_id":id}),
-        )
-        .await?;
-    let mut i = state.inner.lock().await;
-    if i.generation != generation {
-        return Err("会话已变更，请重新选择".into());
+async fn select_conversation(
+    state: State<'_, Desktop>,
+    id: String,
+    store: String,
+) -> Result<(), String> {
+    let _transition = state.begin_transition()?;
+    if state.inner.lock().await.view.session_id == id {
+        return Ok(());
     }
-    apply_session(&mut i.view, &session)
+    // Only native history entries for this workspace may select a store.
+    let records = list_conversations(&state).await?;
+    if !records
+        .as_array()
+        .is_some_and(|rows| rows.iter().any(|r| r["id"] == id && r["store"] == store))
+    {
+        return Err("此工作目录中找不到该会话".into());
+    }
+    let same_store = state.inner.lock().await.runtime.as_ref().is_some_and(|r| {
+        r.path.file_name().and_then(|n| n.to_str())
+            == Some(if store == "legacy" { "runtime" } else { &store })
+    });
+    // Claim before stopping this window's task or mutating Runtime metadata.
+    let target = if same_store {
+        None
+    } else {
+        Some(claim_runtime(&state.home, &store)?)
+    };
+    stop_internal(&state).await?;
+    let (previous_view, previous_runtime) = {
+        let mut i = state.inner.lock().await;
+        let previous_view = i.view.clone();
+        let previous_runtime = target.map(|scope| i.runtime.replace(scope));
+        i.view.session_id = id;
+        (previous_view, previous_runtime)
+    };
+    if let Err(error) = ensure_agent(&state).await {
+        let mut i = state.inner.lock().await;
+        i.view = previous_view;
+        if let Some(previous) = previous_runtime {
+            i.runtime = previous;
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 #[tauri::command]
-async fn snapshot(state: State<'_, Desktop>) -> Result<Snapshot, String> {
-    let initialize = {
-        let i = state.inner.lock().await;
-        i.agent.is_none()
-            && i.view.session_id.is_empty()
-            && i.view.api_configured
-            && i.view.error.is_none()
-    };
-    if initialize {
-        if let Err(error) = ensure_agent(&state).await {
-            state.inner.lock().await.view.error = Some(error);
+async fn snapshot(app: tauri::AppHandle, state: State<'_, Desktop>) -> Result<Snapshot, String> {
+    let view = state.inner.lock().await.view.clone();
+    if let Some(window) = app.get_webview_window("main") {
+        let title = format!(
+            "{} · {} · Codewhale-MedSci [{}]",
+            view.workspace.as_deref().unwrap_or("未选择工作目录"),
+            if view.session_id.is_empty() {
+                "新会话"
+            } else {
+                &view.session_id
+            },
+            std::process::id()
+        );
+        if window.title().ok().as_deref() != Some(&title) {
+            let _ = window.set_title(&title);
         }
     }
-    Ok(state.inner.lock().await.view.clone())
+    Ok(view)
 }
 async fn switch_workspace(state: &Desktop, path: String) -> Result<(), String> {
+    let _transition = state.begin_transition()?;
+    switch_workspace_inner(state, path).await
+}
+async fn switch_workspace_inner(state: &Desktop, path: String) -> Result<(), String> {
     let path = canonical(&path)?.to_string_lossy().into_owned();
     let mut i = state.inner.lock().await;
     if i.view.workspace.as_ref() == Some(&path) {
@@ -308,6 +674,7 @@ async fn switch_workspace(state: &Desktop, path: String) -> Result<(), String> {
     i.generation += 1;
     i.thread = None;
     i.view.session_id.clear();
+    i.runtime = None;
     i.view.messages.clear();
     i.view.cards.clear();
     i.view.metrics = Value::Null;
@@ -319,81 +686,194 @@ async fn switch_workspace(state: &Desktop, path: String) -> Result<(), String> {
 }
 #[tauri::command]
 async fn open_folder(state: State<'_, Desktop>) -> Result<(), String> {
-    if let Some(p) = rfd::AsyncFileDialog::new().pick_folder().await {
+    let workspace = state.inner.lock().await.view.workspace.clone();
+    let mut dialog = rfd::AsyncFileDialog::new().set_title("选择工作目录");
+    if let Some(path) = workspace {
+        dialog = dialog.set_directory(path);
+    }
+    if let Some(p) = dialog.pick_folder().await {
         switch_workspace(&state, p.path().to_string_lossy().into_owned()).await?;
     }
     Ok(())
 }
 #[tauri::command]
+async fn open_file(state: State<'_, Desktop>, path: String) -> Result<(), String> {
+    let workspace = state
+        .inner
+        .lock()
+        .await
+        .view
+        .workspace
+        .clone()
+        .ok_or("未选择工作区")?;
+    let root = PathBuf::from(workspace)
+        .canonicalize()
+        .map_err(|_| "工作区无法访问".to_string())?;
+    let requested = PathBuf::from(path);
+    let resolved = if requested.is_absolute() {
+        requested
+    } else {
+        root.join(requested)
+    }
+    .canonicalize()
+    .map_err(|_| "文件不存在或无法访问".to_string())?;
+    if !resolved.starts_with(&root) || !resolved.is_file() {
+        return Err("只能打开当前工作区内的文件".into());
+    }
+    #[cfg(target_os = "windows")]
+    let mut command = std::process::Command::new("explorer.exe");
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
+    command
+        .arg(&resolved)
+        .spawn()
+        .map_err(|error| format!("无法打开文件：{error}"))?;
+    Ok(())
+}
+#[tauri::command]
 async fn resolve_switch(state: State<'_, Desktop>, allow: bool) -> Result<(), String> {
+    let _transition = state.begin_transition()?;
     let path = state.inner.lock().await.view.pending_workspace.take();
     if allow {
         stop_internal(&state).await?;
         if let Some(p) = path {
-            switch_workspace(&state, p).await?
+            switch_workspace_inner(&state, p).await?
         }
     }
     Ok(())
 }
+#[tauri::command]
+fn api_key_status(provider: String) -> Result<bool, String> {
+    let provider = ProviderKind::parse(&provider)
+        .filter(|p| api_providers().contains(p))
+        .ok_or("不支持的 API 服务商")?;
+    match credential(provider.as_str())?.get_password() {
+        Ok(value) => Ok(!value.is_empty()),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(_) => Err("无法读取系统凭据库中的密钥状态".into()),
+    }
+}
+
+fn validate_api_secret(secret: &str) -> Result<&str, String> {
+    let secret = secret.trim();
+    if secret.is_empty() || secret.chars().all(|c| matches!(c, '*' | '•' | '●')) {
+        return Err("请输入有效的 API 密钥".into());
+    }
+    Ok(secret)
+}
+
+#[tauri::command]
+async fn save_api_key(
+    state: State<'_, Desktop>,
+    provider: String,
+    secret: String,
+) -> Result<bool, String> {
+    let provider = ProviderKind::parse(&provider)
+        .filter(|p| api_providers().contains(p))
+        .ok_or("不支持的 API 服务商")?;
+    let provider = provider.as_str();
+    // Debounce per provider in the host so closing the dialog or changing
+    // providers cannot cancel a submitted edit or write it to another slot.
+    let revision = {
+        let mut edits = state.key_edits.lock().await;
+        let revision = edits.entry(provider.into()).or_default();
+        *revision += 1;
+        *revision
+    };
+    if secret.is_empty() {
+        return Ok(false);
+    } // Clear cancels pending input; keeps the stored key.
+    let secret = validate_api_secret(&secret)?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let edits = state.key_edits.lock().await;
+    if edits.get(provider) != Some(&revision) {
+        return Ok(false);
+    }
+    let mut i = state.inner.lock().await;
+    credential(provider)?
+        .set_password(secret)
+        .map_err(|_| "密钥自动保存失败".to_string())?;
+    if i.view.settings.provider == provider {
+        i.view.api_configured = true;
+        i.credentials_changed = true;
+    }
+    Ok(true)
+}
+
 #[tauri::command]
 async fn save_api(
     state: State<'_, Desktop>,
     settings: Settings,
     secret: String,
 ) -> Result<(), String> {
+    let _transition = state.begin_transition()?;
     let settings = validate_settings(settings)?;
     let mut i = state.inner.lock().await;
     if i.view.busy {
         return Err("请先停止当前任务再修改 API 设置".into());
     }
     if !secret.is_empty() {
-        if secret.trim().is_empty() {
-            return Err("API 密钥不能为空白".into());
-        }
-        credential()?
-            .set_password(secret.trim())
+        credential(&settings.provider)?
+            .set_password(validate_api_secret(&secret)?)
             .map_err(|_| "密钥保存失败".to_string())?;
     }
-    let temp = state.home.join("settings.tmp");
-    std::fs::write(
-        &temp,
-        serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    std::fs::rename(temp, state.home.join("settings.json")).map_err(|e| e.to_string())?;
+    save_settings(&state.home, &settings)?;
     if let Some(a) = i.agent.take() {
         a.kill().await
     }
     i.generation += 1;
     i.thread = None;
+    i.credentials_changed = false;
     i.view.settings = settings;
-    i.view.api_configured = key().is_ok();
+    i.view.api_configured = key(&i.view.settings.provider).is_ok();
     i.view.status = "未启动".into();
     Ok(())
 }
 #[tauri::command]
-async fn delete_api(state: State<'_, Desktop>) -> Result<(), String> {
+async fn delete_api(state: State<'_, Desktop>, provider: String) -> Result<(), String> {
+    let _transition = state.begin_transition()?;
+    let provider = ProviderKind::parse(&provider)
+        .filter(|p| api_providers().contains(p))
+        .ok_or("不支持的 API 服务商")?;
     stop_internal(&state).await?;
-    match credential()?.delete_credential() {
+    match credential(provider.as_str())?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => {}
         Err(_) => return Err("删除系统凭据失败".into()),
     }
-    state.inner.lock().await.view.api_configured = false;
+    let mut i = state.inner.lock().await;
+    i.view.api_configured = key(&i.view.settings.provider).is_ok();
     Ok(())
 }
 #[tauri::command]
 async fn test_api(state: State<'_, Desktop>) -> Result<String, String> {
     let s = state.inner.lock().await.view.settings.clone();
-    let secret = key().unwrap_or_default();
+    let secret = key(&s.provider)?;
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(12))
         .build()
         .map_err(|_| "网络初始化失败".to_string())?;
-    let response = client
-        .get(format!("{}/models", s.base_url.trim_end_matches('/')))
-        .bearer_auth(secret)
+    let provider = ProviderKind::parse(&s.provider).ok_or("不支持的服务商")?;
+    let anthropic = provider.provider().wire_policy().fixed()
+        == Some(codewhale_config::provider::WireFormat::AnthropicMessages);
+    let base = s.base_url.trim_end_matches('/');
+    let endpoint = if anthropic && !base.ends_with("/v1") {
+        format!("{base}/v1/models")
+    } else {
+        format!("{base}/models")
+    };
+    let request = client.get(endpoint);
+    let request = if anthropic {
+        request
+            .header("x-api-key", &secret)
+            .header("anthropic-version", "2023-06-01")
+    } else {
+        request.bearer_auth(&secret)
+    };
+    let response = request
         .send()
         .await
         .map_err(|_| "直连失败：请检查网络。当前构建尚未启用系统代理回退。".to_string())?;
@@ -404,22 +884,40 @@ async fn test_api(state: State<'_, Desktop>) -> Result<String, String> {
         ));
     }
     state.inner.lock().await.view.network = "直连".into();
-    Ok("连接成功；模型视觉能力需通过实际图片任务验证".into())
+    Ok("模型列表接口连接成功；所选模型的调用权限需通过实际任务验证".into())
+}
+async fn refresh_api_credentials(i: &mut Inner) {
+    if i.credentials_changed {
+        if let Some(agent) = i.agent.take() {
+            agent.kill().await;
+        }
+        i.thread = None;
+        i.generation += 1;
+        i.credentials_changed = false;
+    }
 }
 async fn ensure_agent(state: &Desktop) -> Result<(Arc<Agent>, String, u64), String> {
     let mut i = state.inner.lock().await;
+    if !i.view.busy {
+        refresh_api_credentials(&mut i).await;
+    }
     if let (Some(a), Some(t)) = (&i.agent, &i.thread) {
         return Ok((a.clone(), t.clone(), i.generation));
     }
     let path = i.view.workspace.clone().ok_or("请先选择工作文件夹")?;
-    let secret = key()?;
     let s = i.view.settings.clone();
-    let config = state.home.join("agent.toml");
+    let secret = key(&s.provider)?;
+    let config = state.instance.path().join("agent.toml");
+    if i.runtime.is_none() {
+        i.runtime = Some(new_runtime(&state.home)?);
+    }
     // Serialize strings as JSON: these quoted strings are also valid TOML basic strings.
     let cfg = format!(
-        "provider = \"deepseek\"\nmodel = {}\nbase_url = {}\napproval_policy = \"auto\"\nsandbox_mode = \"danger-full-access\"\nsandbox_network_access = true\ntelemetry = false\nlocale = \"zh-Hans\"\n[features]\nmcp = false\n",
+        "provider = {}\nmodel = {}\nbase_url = {}\nreasoning_effort = {}\napproval_policy = \"auto\"\nsandbox_mode = \"danger-full-access\"\nsandbox_network_access = true\ntelemetry = false\nlocale = \"zh-Hans\"\n[features]\nmcp = false\n",
+        json!(s.provider),
         json!(s.model),
-        json!(s.base_url)
+        json!(s.base_url),
+        json!(s.reasoning_effort)
     );
     std::fs::write(&config, cfg).map_err(|e| e.to_string())?;
     let binary = state.resources.join(if cfg!(windows) {
@@ -434,6 +932,11 @@ async fn ensure_agent(state: &Desktop) -> Result<(Arc<Agent>, String, u64), Stri
         .home
         .join("python/shared/current")
         .join(if cfg!(windows) { "Scripts" } else { "bin" });
+    let python_lease = open_lock(&state.home.join("python/shared/usage.lock"))?;
+    python_lease
+        .try_lock_shared()
+        .map_err(|_| "共享 Python 正在更新，请稍后重试".to_string())?;
+    let python_lease = shared.is_dir().then_some(python_lease);
     i.view.status = "启动中".into();
     let (a, mut events) = Agent::start(
         &binary,
@@ -441,7 +944,13 @@ async fn ensure_agent(state: &Desktop) -> Result<(Arc<Agent>, String, u64), Stri
         &state.home.join("agent"),
         &config,
         &secret,
+        ProviderKind::parse(&s.provider)
+            .ok_or("不支持的服务商")?
+            .provider()
+            .env_vars()[0],
         shared.is_dir().then_some(shared.as_path()),
+        python_lease,
+        &i.runtime.as_ref().ok_or("会话存储未初始化")?.path,
     )
     .await?;
     let health = tokio::time::timeout(Duration::from_secs(20), a.request("healthz", json!({})))
@@ -452,6 +961,10 @@ async fn ensure_agent(state: &Desktop) -> Result<(Arc<Agent>, String, u64), Stri
         return Err("Agent 版本不兼容，需要 0.9.13".into());
     }
     let caps = a.request("capabilities", json!({})).await?;
+    if caps["desktop_multi_instance"] != true {
+        a.kill().await;
+        return Err("Agent 不支持独立会话存储，请更新完整安装包".into());
+    }
     if !caps["methods"]
         .as_array()
         .is_some_and(|v| v.contains(&json!("desktop/approval")))
@@ -462,7 +975,7 @@ async fn ensure_agent(state: &Desktop) -> Result<(Arc<Agent>, String, u64), Stri
     let started = a
         .request(
             "thread/start",
-            json!({"cwd":path,"model":s.model,"model_provider":"deepseek"}),
+            json!({"cwd":path,"model":s.model,"model_provider":s.provider}),
         )
         .await?;
     let thread = started["thread_id"]
@@ -472,7 +985,7 @@ async fn ensure_agent(state: &Desktop) -> Result<(Arc<Agent>, String, u64), Stri
     let session = a
         .request(
             "desktop/session",
-            json!({"thread_id":thread,"runtime_id":if i.view.session_id.is_empty(){None}else{Some(&i.view.session_id)},"operation":if i.view.session_id.is_empty(){"latest"}else{"read"}}),
+            json!({"thread_id":thread,"runtime_id":if i.view.session_id.is_empty(){None}else{Some(&i.view.session_id)},"operation":if i.view.session_id.is_empty(){"new"}else{"read"}}),
         )
         .await?;
     apply_session(&mut i.view, &session)?;
@@ -510,6 +1023,8 @@ async fn ensure_agent(state: &Desktop) -> Result<(Arc<Agent>, String, u64), Stri
                             sequence,
                             role: "user".into(),
                             text: event["payload"]["input"].as_str().unwrap_or("").into(),
+                            streaming: false,
+                            duration_ms: None,
                         });
                         i.view.status = "执行中 · 已接收补充指令".into();
                     }
@@ -534,21 +1049,7 @@ async fn ensure_agent(state: &Desktop) -> Result<(Arc<Agent>, String, u64), Stri
                                 && (c["payload"]["input_id"] == id || c["payload"]["id"] == id))
                         });
                     }
-                    if name.starts_with("approval.")
-                        || name.starts_with("user_input.")
-                        || name.starts_with("item.")
-                    {
-                        let mut card = event.clone();
-                        card["sequence"] = json!(next_message_sequence(&i.view));
-                        if let Some(p) = card["payload"].as_object_mut() {
-                            p.remove("arguments");
-                            p.remove("output");
-                        }
-                        i.view.cards.push(card);
-                        if i.view.cards.len() > 100 {
-                            i.view.cards.remove(0);
-                        }
-                    }
+                    record_timeline_card(&mut i.view, &event);
                 }
                 "crashed" => {
                     i.view.status = "已退出".into();
@@ -567,46 +1068,16 @@ async fn ensure_agent(state: &Desktop) -> Result<(Arc<Agent>, String, u64), Stri
 async fn send_message(
     state: State<'_, Desktop>,
     text: String,
-    images: Vec<Value>,
+    references: Vec<FileReference>,
 ) -> Result<(), String> {
-    if text.trim().is_empty() && images.is_empty() {
+    let _transition = state.begin_transition()?;
+    let text = file_references::prepend(text, references)?;
+    if text.trim().is_empty() {
         return Err("请输入任务".into());
-    }
-    if text.len() > 128 * 1024 || images.len() > 10 {
-        return Err("任务或附件超过限制".into());
-    }
-    let mut total_bytes = 0usize;
-    for image in &images {
-        use base64::Engine;
-        let mime = image["mime"].as_str().ok_or("图片格式缺失")?;
-        let encoded = image["dataBase64"].as_str().ok_or("图片数据缺失")?;
-        if encoded.len() > 6 * 1024 * 1024 {
-            return Err("单图上限为 4 MB".into());
-        }
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|_| "图片编码无效".to_string())?;
-        total_bytes += bytes.len();
-        if bytes.len() > 4 * 1024 * 1024 || total_bytes > 5 * 1024 * 1024 {
-            return Err("附件总计不能超过 5 MB".into());
-        }
-        let valid = match mime {
-            "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-            "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-            "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
-            "image/webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
-            _ => false,
-        };
-        if !valid {
-            return Err("图片内容与声明格式不符".into());
-        }
     }
     {
         let mut i = state.inner.lock().await;
         if i.view.busy {
-            if !images.is_empty() {
-                return Err("Codewhale 当前 steer 接口仅支持文字，请在本轮完成后发送图片".into());
-            }
             let agent = i
                 .agent
                 .clone()
@@ -631,11 +1102,7 @@ async fn send_message(
             });
             return Ok(());
         }
-        if !images.is_empty()
-            && !(official(&i.view.settings.base_url) && i.view.settings.model == "deepseek-flash")
-        {
-            return Err("该精确路由的视觉能力未知，请选择官方 DeepSeek Flash".into());
-        }
+        refresh_api_credentials(&mut i).await;
         i.view.busy = true;
         i.stop_requested = false;
         i.view.error = None;
@@ -666,16 +1133,15 @@ async fn send_message(
             sequence,
             role: "user".into(),
             text: text.clone(),
+            streaming: false,
+            duration_ms: None,
         });
         i.view.status = "执行中".into();
     }
     let inner = state.inner.clone();
     tokio::spawn(async move {
         let result = a
-            .request(
-                "thread/message",
-                json!({"thread_id":thread,"input":text,"images":images}),
-            )
+            .request("thread/message", json!({"thread_id":thread,"input":text}))
             .await;
         let metrics = a
             .request("desktop/session", json!({"thread_id":thread}))
@@ -746,25 +1212,25 @@ async fn stop(state: State<'_, Desktop>) -> Result<(), String> {
 }
 #[tauri::command]
 async fn restart(state: State<'_, Desktop>) -> Result<(), String> {
+    let _transition = state.begin_transition()?;
     stop_internal(&state).await?;
     ensure_agent(&state).await?;
     Ok(())
 }
 #[tauri::command]
 async fn new_session(state: State<'_, Desktop>) -> Result<(), String> {
+    let _transition = state.begin_transition()?;
     stop_internal(&state).await?;
-    let (a, thread, generation) = ensure_agent(&state).await?;
-    let session = a
-        .request(
-            "desktop/session",
-            json!({"thread_id":thread,"operation":"new"}),
-        )
-        .await?;
-    let mut i = state.inner.lock().await;
-    if i.generation != generation {
-        return Err("会话已变更".into());
+    {
+        let mut i = state.inner.lock().await;
+        i.runtime = None;
+        i.view.session_id.clear();
+        i.view.messages.clear();
+        i.view.cards.clear();
+        i.view.metrics = Value::Null;
     }
-    apply_session(&mut i.view, &session)
+    ensure_agent(&state).await?;
+    Ok(())
 }
 #[tauri::command]
 async fn decision(state: State<'_, Desktop>, id: String, allow: bool) -> Result<(), String> {
@@ -862,16 +1328,19 @@ async fn ensure_python(state: &Desktop) -> Result<String, String> {
                 .rev()
                 .find(|line| !line.trim().is_empty())
                 .unwrap_or("初始化进程未返回错误详情");
-            let cause = redact(cause, &key().unwrap_or_default());
+            let cause = redact(cause, &key(&i.view.settings.provider).unwrap_or_default());
             Err(format!("共享环境初始化失败；原环境保持不变。{cause}"))
         }
     }
 }
 #[tauri::command]
 async fn initialize_python(state: State<'_, Desktop>) -> Result<String, String> {
+    let _transition = state.begin_transition()?;
     if state.inner.lock().await.view.busy {
         return Err("请先停止 Agent，再更新共享环境".into());
     }
+    // Release this window's environment lease. Other windows remain protected.
+    stop_internal(&state).await?;
     ensure_python(&state).await
 }
 #[tauri::command]
@@ -880,26 +1349,7 @@ fn company_login() -> Result<(), String> {
 }
 fn main() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, args, _| {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.set_focus();
-            }
-            if let Some(p) = args.iter().skip(1).find(|v| !v.starts_with('-')).cloned() {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app.state::<Desktop>();
-                    if let Err(e) = switch_workspace(&state, p).await {
-                        state.inner.lock().await.view.error = Some(e)
-                    }
-                });
-            }
-        }))
         .setup(|app| {
-            #[cfg(windows)]
-            if let Some(window) = app.get_webview_window("main") {
-                window.set_decorations(false)?;
-            }
             let home = app
                 .path()
                 .app_local_data_dir()?
@@ -918,19 +1368,27 @@ fn main() {
                 .and_then(|s| validate_settings(s).ok())
                 .unwrap_or_default();
             let argument = std::env::args().skip(1).find(|a| !a.starts_with('-'));
-            let (path, startup_error) =
-                match startup_workspace(argument.as_deref(), &app.path().home_dir()?) {
-                    Ok(path) => (Some(path), None),
-                    Err(error) => (None, Some(error)),
-                };
+            let launch_dir = std::env::current_dir().unwrap_or(app.path().home_dir()?);
+            let (path, startup_error) = match startup_workspace(argument.as_deref(), &launch_dir) {
+                Ok(path) => (Some(path), None),
+                Err(error) => (None, Some(error)),
+            };
             let resources = app.path().resource_dir()?.join("resources");
+            let instances = home.join("instances");
+            std::fs::create_dir_all(&instances)?;
+            let instance = tempfile::Builder::new()
+                .prefix("window-")
+                .tempdir_in(instances)?;
+            // Build from the merged platform configuration to preserve Windows
+            // custom chrome. Browser data and caches belong to this instance.
+            let webview_data = instance.path().join("webview");
             let view = Snapshot {
                 workspace: path,
                 session_id: String::new(),
                 metrics: Value::Null,
                 status: "未启动".into(),
                 busy: false,
-                api_configured: key().is_ok(),
+                api_configured: key(&settings.provider).is_ok(),
                 settings,
                 messages: vec![],
                 cards: vec![],
@@ -951,11 +1409,20 @@ fn main() {
                     thread: None,
                     generation: 0,
                     stop_requested: false,
+                    credentials_changed: false,
+                    runtime: None,
                 })),
                 home,
                 resources,
                 runtime_transaction: Mutex::new(()),
+                key_edits: Mutex::new(std::collections::HashMap::new()),
+                instance,
+                session_transition: Mutex::new(()),
             });
+            tauri::WebviewWindowBuilder::from_config(app, &app.config().app.windows[0])?
+                .data_directory(webview_data)
+                .incognito(true)
+                .build()?;
             #[cfg(target_os = "macos")]
             {
                 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
@@ -1024,11 +1491,18 @@ fn main() {
             conversations,
             select_conversation,
             open_folder,
+            open_file,
             resolve_switch,
+            api_catalog,
+            api_key_status,
+            save_api_key,
+            api_efforts,
             save_api,
             delete_api,
             test_api,
             send_message,
+            clipboard_file_references,
+            resolve_file_references,
             stop,
             restart,
             new_session,
@@ -1051,6 +1525,104 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn multi_instance_python_update_guard() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let python = repository.join("apps/desktop/src-tauri/resources/python/cpython/python.exe");
+        let manager = repository.join("desktop/runtime/manager.py");
+        let home = tempfile::tempdir().unwrap();
+        let first = open_lock(&home.path().join("usage.lock")).unwrap();
+        first.try_lock_shared().unwrap();
+        let second = open_lock(&home.path().join("usage.lock")).unwrap();
+        second.try_lock_shared().unwrap();
+        let probe = |blocked: bool| {
+            let output = std::process::Command::new(&python).args(["-I", "-X", "utf8", "-c",
+                "import importlib.util,pathlib,sys\ns=importlib.util.spec_from_file_location('manager',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)\ndef reached(home): raise RuntimeError('RECOVERY_ENTERED')\nm.recover=reached\ntry: m.transact(pathlib.Path(sys.argv[2]))\nexcept RuntimeError as e: assert ('RECOVERY_ENTERED' not in str(e)) == (sys.argv[3]=='true'), str(e)\nelse: raise AssertionError('missing probe')"])
+                .arg(&manager).arg(home.path()).arg(blocked.to_string()).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        probe(true);
+        drop(first);
+        probe(true);
+        drop(second);
+        probe(false);
+    }
+    #[test]
+    fn multi_instance_child() {
+        let Some(home) = std::env::var_os("MEDSCI_TEST_HOME") else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        if let Ok(scope) = std::env::var("MEDSCI_TEST_SCOPE") {
+            assert!(
+                claim_runtime(&home, &scope).is_err(),
+                "another process owns this session"
+            );
+        } else {
+            assert!(
+                save_settings(&home, &Settings::default()).is_err(),
+                "another process is saving settings"
+            );
+        }
+    }
+    #[test]
+    fn multi_instance_storage_and_settings() {
+        let home = tempfile::tempdir().unwrap();
+        let first = new_runtime(home.path()).unwrap();
+        let second = new_runtime(home.path()).unwrap();
+        assert_ne!(first.path, second.path);
+        let scope = first.path.file_name().unwrap().to_str().unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::multi_instance_child"])
+            .env("MEDSCI_TEST_HOME", home.path())
+            .env("MEDSCI_TEST_SCOPE", scope)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stdout)
+        );
+        let saved_path = first.path.clone();
+        std::fs::write(saved_path.join("history-receipt"), "keep").unwrap();
+        let scope = scope.to_string();
+        drop(first);
+        assert!(claim_runtime(home.path(), &scope).is_ok());
+        assert_eq!(
+            std::fs::read_to_string(saved_path.join("history-receipt")).unwrap(),
+            "keep"
+        );
+        assert!(claim_runtime(home.path(), "../escape").is_err());
+        save_settings(home.path(), &Settings::default()).unwrap();
+        let lock = open_lock(&home.path().join("settings.lock")).unwrap();
+        lock.try_lock().unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::multi_instance_child"])
+            .env("MEDSCI_TEST_HOME", home.path())
+            .env_remove("MEDSCI_TEST_SCOPE")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stdout)
+        );
+        drop(lock);
+        let changed = Settings {
+            model: "another-model".into(),
+            ..Settings::default()
+        };
+        save_settings(home.path(), &changed).unwrap();
+        let restored: Settings =
+            serde_json::from_slice(&std::fs::read(home.path().join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(restored.model, "another-model");
+    }
     #[test]
     fn native_history_is_the_only_rendered_session() {
         let mut view = Snapshot {
@@ -1065,6 +1637,8 @@ mod tests {
                 sequence: 1,
                 role: "assistant".into(),
                 text: "stale GUI copy".into(),
+                streaming: false,
+                duration_ms: None,
             }],
             cards: vec![],
             error: None,
@@ -1134,9 +1708,66 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&messages).unwrap()).unwrap();
         assert_eq!(restored[0].role, "reasoning");
         assert_eq!(restored[0].text, "先检查资料。");
+        assert!(!restored[0].streaming);
     }
     #[test]
-    fn launchpad_defaults_to_home_but_explicit_workspace_wins() {
+    fn reasoning_duration_uses_runtime_item_timestamps() {
+        let item = json!({
+            "started_at":"2026-09-19T08:00:00.100Z",
+            "ended_at":"2026-09-19T08:00:08.650Z"
+        });
+        assert_eq!(item_duration_ms(&item), Some(8_550));
+        assert_eq!(item_duration_ms(&json!({})), None);
+    }
+    #[test]
+    fn tool_lifecycle_updates_one_timeline_card() {
+        let mut view = Snapshot {
+            workspace: None,
+            session_id: String::new(),
+            metrics: Value::Null,
+            status: String::new(),
+            busy: true,
+            api_configured: false,
+            settings: Settings::default(),
+            messages: vec![],
+            cards: vec![],
+            error: None,
+            pending_workspace: None,
+            network: String::new(),
+            python: String::new(),
+        };
+        record_timeline_card(
+            &mut view,
+            &json!({
+                "event":"item.started",
+                "item_id":"item_tool",
+                "payload":{
+                    "item":{"id":"item_tool","kind":"tool_call","status":"in_progress","detail":"{}"},
+                    "tool":{"id":"call_1","name":"File","input":{"action":"read","path":"report.md"}}
+                }
+            }),
+        );
+        let sequence = view.cards[0]["sequence"].as_u64().unwrap();
+        record_timeline_card(
+            &mut view,
+            &json!({
+                "event":"item.completed",
+                "item_id":"item_tool",
+                "payload":{"item":{
+                    "id":"item_tool","kind":"tool_call","status":"completed",
+                    "summary":"File: read 12 lines","detail":"read 12 lines",
+                    "metadata":{"tool_use_id":"call_1","tool_name":"File","tool_input":"{\"action\":\"read\",\"path\":\"report.md\"}"}
+                }}
+            }),
+        );
+        assert_eq!(view.cards.len(), 1);
+        assert_eq!(view.cards[0]["sequence"], sequence);
+        assert_eq!(view.cards[0]["event"], "item.completed");
+        assert_eq!(view.cards[0]["payload"]["tool"]["name"], "File");
+        assert_eq!(view.cards[0]["payload"]["item"]["detail"], "read 12 lines");
+    }
+    #[test]
+    fn launch_directory_is_default_but_explicit_workspace_wins() {
         let home = std::env::temp_dir().canonicalize().unwrap();
         let project = std::env::current_dir().unwrap().canonicalize().unwrap();
         assert_eq!(
@@ -1168,6 +1799,80 @@ mod tests {
                 }
             );
         }
+    }
+    #[test]
+    fn api_settings_keep_legacy_credentials_and_validate_model_effort() {
+        let old: Settings = serde_json::from_value(json!({"schema_version":1,"model":"deepseek-flash","base_url":"https://api.deepseek.com"})).unwrap();
+        let migrated = validate_settings(old).unwrap();
+        assert_eq!(migrated.provider, "deepseek");
+        assert_eq!(migrated.reasoning_effort, "auto");
+        assert_eq!(migrated.schema_version, 2);
+        for (provider, model, valid, invalid) in [
+            (ProviderKind::Deepseek, "deepseek-flash", "low", "medium"),
+            (ProviderKind::Moonshot, "kimi-k3", "low", "off"),
+            (ProviderKind::Moonshot, "kimi-k2.6", "off", "max"),
+            (ProviderKind::Zai, "GLM-5.3", "max", "off"),
+        ] {
+            let settings = Settings {
+                provider: provider.as_str().into(),
+                model: model.into(),
+                base_url: provider.provider().default_base_url().into(),
+                reasoning_effort: valid.into(),
+                ..Default::default()
+            };
+            assert!(validate_settings(settings.clone()).is_ok(), "{model}");
+            assert!(
+                validate_settings(Settings {
+                    reasoning_effort: invalid.into(),
+                    ..settings
+                })
+                .is_err(),
+                "{model}"
+            );
+            assert_eq!(
+                effort_options(provider, "https://proxy.example/v1", model),
+                ["auto"]
+            );
+        }
+    }
+    #[test]
+    fn api_key_masks_and_empty_edits_cannot_replace_a_credential() {
+        for invalid in ["", "  ", "********", "••••••••", "●●●●"] {
+            assert!(validate_api_secret(invalid).is_err());
+        }
+        assert_eq!(
+            validate_api_secret("  example-test-key  ").unwrap(),
+            "example-test-key"
+        );
+    }
+
+    #[test]
+    fn api_catalog_offers_native_defaults_without_oauth_only_routes() {
+        let catalog = api_catalog();
+        let rows = catalog.as_array().unwrap();
+        for kind in [
+            ProviderKind::Deepseek,
+            ProviderKind::Moonshot,
+            ProviderKind::Zai,
+        ] {
+            let row = rows.iter().find(|row| row["id"] == kind.as_str()).unwrap();
+            assert!(
+                row["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|model| model["id"] == row["model"])
+            );
+            assert!(!kind.provider().env_vars().is_empty());
+        }
+        assert!(!rows.iter().any(|row| row["id"] == "openai-codex"));
+        assert!(
+            validate_settings(Settings {
+                provider: "unknown".into(),
+                ..Default::default()
+            })
+            .is_err()
+        );
     }
     #[test]
     fn endpoints_reject_credential_leaks() {

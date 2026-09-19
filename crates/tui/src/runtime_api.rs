@@ -1142,6 +1142,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             )),
         )
         .route("/v1/threads", get(list_threads).post(create_thread))
+        .route("/v1/desktop/history", get(desktop_history))
         .route("/v1/threads/summary", get(list_threads_summary))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
         .route("/v1/threads/{id}/resume", post(resume_thread))
@@ -1623,6 +1624,21 @@ async fn list_threads(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(threads))
+}
+
+async fn desktop_history(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    if std::env::var("CODEWHALE_DESKTOP_SUPERVISED").as_deref() != Ok("1") {
+        return Err(ApiError::bad_request(
+            "Desktop history is only available to the desktop host",
+        ));
+    }
+    state
+        .runtime_threads
+        .desktop_history()
+        .map(Json)
+        .map_err(|e| ApiError::internal(e.to_string()))
 }
 
 async fn list_threads_summary(

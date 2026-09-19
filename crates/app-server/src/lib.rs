@@ -1524,6 +1524,33 @@ async fn desktop_session(
     let mut bridge = shared.lock().await;
     // The Runtime store is the sole session authority; desktop only projects it.
     let operation = params["operation"].as_str().unwrap_or("read");
+    if operation == "list" && std::env::var("CODEWHALE_DESKTOP_SUPERVISED").as_deref() == Ok("1") {
+        let records = bridge
+            .request_json(
+                bridge.authed(
+                    bridge
+                        .client
+                        .get(format!("{}/v1/desktop/history", bridge.base_url)),
+                ),
+            )
+            .await
+            .map_err(|e| JsonRpcError::runtime_unavailable(e.to_string()))?;
+        return Ok(Value::Array(
+            records
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|record| {
+                    record["workspace"]
+                        .as_str()
+                        .and_then(|p| Path::new(p).canonicalize().ok())
+                        .as_ref()
+                        == Some(&workspace)
+                })
+                .cloned()
+                .collect(),
+        ));
+    }
     let mut latest = None;
     if matches!(operation, "list" | "latest") {
         let records = bridge
@@ -2371,6 +2398,7 @@ async fn dispatch_stdio_request_with_writer<W: AsyncWrite + Unpin>(
                     "transport": transport.label(),
                     "families": ["thread/*", "app/*", "prompt/*"],
                     "turn_image_inputs": true,
+                    "desktop_multi_instance": true,
                     "methods": methods,
                 }),
                 should_exit: false,

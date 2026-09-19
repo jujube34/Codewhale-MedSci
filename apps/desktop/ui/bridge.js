@@ -20,26 +20,101 @@ if (document.documentElement.classList.contains('windows')) {
 }
 
 let attachments = [];
-window.medsciImages = () => attachments.map(({mime,dataBase64})=>({mime,dataBase64}));
-window.medsciClearImages = () => {attachments=[];renderAttachments();};
+let referenceQueue = Promise.resolve(), pendingReferences = 0, nextReferenceId = 0;
+window.medsciReferences = () => attachments.map(a => ({...a}));
+window.medsciReferencesPending = () => pendingReferences > 0;
+window.medsciRemoveReferences = sent => {
+ const ids = new Set(JSON.parse(sent).map(a => a.id));
+ attachments = attachments.filter(a => !ids.has(a.id));
+ referenceNotice();
+ renderAttachments();
+};
+window.medsciCopyText = async text => {
+ try {
+  if (navigator.clipboard?.writeText) {
+   await navigator.clipboard.writeText(String(text));
+   return true;
+  }
+ } catch (_) {}
+ const textarea=document.createElement('textarea');
+ textarea.value=String(text);textarea.readOnly=true;
+ textarea.style.cssText='position:fixed;opacity:0;pointer-events:none';
+ document.body.append(textarea);textarea.select();
+ const copied=document.execCommand('copy');textarea.remove();
+ if(!copied)throw new Error('复制失败');
+ return true;
+};
+function referenceNotice(message='') {
+ const notice=document.getElementById('reference-notice');
+ if(notice)notice.textContent=message;
+}
 function renderAttachments(){
  const host=document.getElementById('attachments'); if(!host)return;
  host.replaceChildren();
- attachments.forEach((a,i)=>{const b=document.createElement('button');b.className='attachment';b.title=`${a.name} · ${a.width} × ${a.height} · ${Math.round(a.bytes/1024)} KB · 点击移除`;const img=document.createElement('img');img.src=`data:${a.mime};base64,${a.dataBase64}`;img.alt=a.name; b.append(img,document.createTextNode(`${a.name} ×`));b.onclick=()=>{attachments.splice(i,1);renderAttachments()};host.append(b)});
-}
-async function add(files){
- for(const file of files){
-  if(!['image/png','image/jpeg','image/gif','image/webp'].includes(file.type))throw new Error('仅支持 PNG、JPEG、GIF 和 WebP');
-  if(file.size>4*1024*1024 || attachments.reduce((s,a)=>s+a.bytes,0)+file.size>5*1024*1024 || attachments.length>=10)throw new Error('单图上限 4 MB，附件总计不超过 5 MB / 10 张');
-  const data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=reject;r.readAsDataURL(file)});
-  const image=new Image();image.src=data;await image.decode();if(image.width*image.height>40_000_000)throw new Error('图片尺寸过大');
-  attachments.push({mime:file.type,dataBase64:data.split(',')[1],name:file.name,bytes:file.size,width:image.width,height:image.height});
+ for(const a of attachments){
+  const label=`${a.isDirectory?'文件夹':'文件'}${String.fromCharCode(65+a.slot)}`;
+  const row=document.createElement('div');row.className='file-reference';row.setAttribute('role','listitem');
+  const remove=document.createElement('button');remove.type='button';remove.className='remove-reference';
+  remove.textContent='×';remove.title=`移除${label}`;remove.setAttribute('aria-label',`移除${label}：${a.path}`);
+  remove.onclick=()=>{attachments=attachments.filter(item=>item.id!==a.id);referenceNotice();renderAttachments()};
+  const extension=a.path.split(/[\\/]/).pop().split('.').pop().toLowerCase();
+  const kind=a.isDirectory?'folder':(['docx','xlsx','pptx','pdf'].includes(extension)?extension:'file');
+  const icon=document.createElement('span');icon.className=`reference-icon icon-${kind}`;icon.setAttribute('aria-hidden','true');
+  icon.textContent=({docx:'W',xlsx:'X',pptx:'P',pdf:'PDF',folder:'',file:''})[kind];
+  const name=document.createElement('span');name.className='reference-name';name.textContent=label;
+  const path=document.createElement('span');path.className='reference-path';path.textContent=a.path;path.title=a.path;
+  row.append(remove,icon,name,path);host.append(row);
  }
- renderAttachments();
+ host.dispatchEvent(new Event('input',{bubbles:true}));
 }
-window.medsciAttach=()=>{const input=document.createElement('input');input.type='file';input.accept='image/png,image/jpeg,image/gif,image/webp';input.multiple=true;input.onchange=()=>add(input.files).catch(e=>alert(e.message));input.click()};
-document.addEventListener('paste',e=>{if(e.clipboardData.files.length){e.preventDefault();add(e.clipboardData.files).catch(e=>alert(e.message))}});
-document.addEventListener('dragover',e=>e.preventDefault());document.addEventListener('drop',e=>{e.preventDefault();add(e.dataTransfer.files).catch(e=>alert(e.message))});
+function addReferences(files){
+ const added=files.filter(file=>!attachments.some(a=>a.path===file.path));
+ if(attachments.length+added.length>10)throw new Error('最多引用 10 个文件/文件夹，请先移除部分引用');
+ for(const file of added){
+  if(attachments.some(a=>a.path===file.path))continue;
+  const slot=Array.from({length:10},(_,i)=>i).find(i=>!attachments.some(a=>a.slot===i));
+  attachments.push({...file,slot,id:++nextReferenceId});
+ }
+ referenceNotice();renderAttachments();
+}
+function queueReferences(task){
+ pendingReferences++;renderAttachments();
+ referenceQueue=referenceQueue.then(task)
+  .catch(error=>referenceNotice(String(error.message||error)))
+  .finally(()=>{pendingReferences--;renderAttachments()});
+}
+// Only the task composer consumes native file paste. Other text fields keep normal paste.
+document.addEventListener('paste',event=>{
+ const input=event.target;
+ if(!(input instanceof HTMLTextAreaElement)||!input.closest('.composer'))return;
+ const text=event.clipboardData?.getData('text/plain')||'';
+ const hasFiles=Boolean(event.clipboardData?.files.length);
+ if(!window.medsciNative()){
+  if(hasFiles){event.preventDefault();referenceNotice('请在桌面应用中复制并粘贴文件或文件夹');}
+  return;
+ }
+ event.preventDefault();
+ queueReferences(async()=>{
+  const files=await window.medsciInvoke('clipboard_file_references',{});
+  if(files.length){addReferences(files);return;}
+  if(hasFiles){throw new Error('无法获得文件路径，请从文件管理器复制文件或文件夹；不支持直接粘贴截图');}
+  if(text&&input.isConnected){
+   input.focus();
+   // Preserve native undo where available, with a textarea fallback.
+   if(!document.execCommand('insertText',false,text)){
+    input.setRangeText(text,input.selectionStart,input.selectionEnd,'end');
+    input.dispatchEvent(new Event('input',{bubbles:true}));
+   }
+  }
+ });
+});
+// Webview File objects cannot supply absolute paths; never invent a path from a filename.
+document.addEventListener('dragover',event=>{if(event.dataTransfer?.types.includes('Files'))event.preventDefault()});
+document.addEventListener('drop',event=>{
+ if(!event.dataTransfer?.files.length)return;
+ event.preventDefault();
+ if(!window.medsciNative())referenceNotice('请在桌面应用中拖入文件或文件夹');
+});
 document.addEventListener('click',e=>{const a=e.target.closest('a');if(a){e.preventDefault();alert(`链接目标：${a.href}\n请复制到浏览器打开。`)}});
 document.addEventListener('keydown',e=>{
  if(window.__TAURI__ && /Mac/.test(navigator.platform))return; // Native menu owns macOS accelerators.
@@ -47,6 +122,76 @@ document.addEventListener('keydown',e=>{
  if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='o'){e.preventDefault();window.medsciInvoke('open_folder',{}).catch(e=>alert(String(e)));}
 });
 await init();
+// Theme is presentation state only; it never changes the agent/session context.
+const themeToggle = document.createElement('button');
+themeToggle.type = 'button';
+themeToggle.className = 'theme-toggle';
+themeToggle.textContent = '深色模式';
+document.querySelector('.window-controls')?.before(themeToggle);
+themeToggle.addEventListener('click', () => {
+ const dark = document.documentElement.dataset.theme !== 'dark';
+ document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+ themeToggle.textContent = dark ? '浅色模式' : '深色模式';
+});
+if(window.medsciNative()){
+ try{
+  await window.__TAURI__.webview.getCurrentWebview().onDragDropEvent(({payload})=>{
+   const hovering=payload.type==='enter'||payload.type==='over';
+   document.querySelector('.composer')?.classList.toggle('file-drag-active',hovering);
+   if(payload.type==='enter')referenceNotice('松开即可引用文件或文件夹');
+   if(payload.type==='leave'||payload.type==='drop')referenceNotice();
+   if(payload.type==='drop'){
+    const paths=[...payload.paths];
+    queueReferences(async()=>{
+     addReferences(await window.medsciInvoke('resolve_file_references',{paths}));
+     document.querySelector('.composer textarea')?.focus();
+    });
+   }
+  });
+ }catch(error){referenceNotice(`文件拖拽暂不可用：${String(error.message||error)}`);}
+}
+if (window.__TAURI__ && document.documentElement.classList.contains('windows')) {
+ const nativeWindow=window.__TAURI__.window.getCurrentWindow();
+ const resizeHandles=document.createElement('div');
+ resizeHandles.className='window-resize-handles';
+ resizeHandles.setAttribute('aria-hidden','true');
+ for(const direction of ['North','South','East','West','NorthEast','NorthWest','SouthEast','SouthWest']){
+  const handle=document.createElement('div');
+  handle.dataset.resizeDirection=direction;
+  handle.addEventListener('pointerdown',event=>{
+   if(event.button!==0 || document.documentElement.classList.contains('window-maximized'))return;
+   event.preventDefault();event.stopPropagation();
+   nativeWindow.startResizeDragging(direction).catch(console.error);
+  });
+  resizeHandles.append(handle);
+ }
+ document.body.append(resizeHandles);
+ const syncWindowShape=async()=>{
+  try { document.documentElement.classList.toggle('window-maximized',await nativeWindow.isMaximized()); }
+  catch(error){console.error(error);}
+ };
+ await syncWindowShape();
+ await nativeWindow.onResized(syncWindowShape);
+}
+
+// Markdown stays the clipboard source for whole answers; code blocks expose
+// their exact code text as a smaller, hover-only copy target.
+function decorateCodeBlocks(root=document){
+ root.querySelectorAll('pre:not([data-copy-ready])').forEach(pre=>{
+  const code=pre.querySelector(':scope > code');if(!code)return;
+  pre.dataset.copyReady='true';pre.classList.add('code-block');
+  const toolbar=document.createElement('div');toolbar.className='code-toolbar';
+  const language=document.createElement('span');language.className='code-language';
+  language.textContent=[...code.classList].find(name=>name.startsWith('language-'))?.slice(9)||'';
+  const button=document.createElement('button');button.type='button';button.className='copy-code';button.textContent='复制';
+  button.onclick=async()=>{try{await window.medsciCopyText(code.textContent||'');button.textContent='已复制';setTimeout(()=>button.textContent='复制',1500)}catch(error){alert(error.message)}};
+  toolbar.append(language,button);pre.prepend(toolbar);
+ });
+}
+decorateCodeBlocks();
+new MutationObserver(records=>{
+ for(const record of records)for(const node of record.addedNodes)if(node instanceof Element){if(node.matches('pre'))decorateCodeBlocks(node.parentElement||document);else decorateCodeBlocks(node)}
+}).observe(document.body,{childList:true,subtree:true});
 
 // Measure the actual line wrapping, including paste, IME and window resizing.
 let previousDraft, previousWidth, previousTitle;
@@ -69,14 +214,21 @@ document.addEventListener('click',async e=>{
  try{if(control.dataset.window==='minimize')await w.minimize();if(control.dataset.window==='maximize')await w.toggleMaximize();if(control.dataset.window==='close')await w.close();}catch(error){console.error(error);}
 });
 
-// Follow newly appended messages and streaming text without moving keyboard focus.
+// Follow only while the user remains at the tail. Once they scroll up, content
+// can stream without stealing their reading position.
 const conversation=document.querySelector('main');
 if(conversation){
- let scrollPending=false;
+ const latest=document.getElementById('back-to-latest');
+ const tailThreshold=48;
+ let scrollPending=false,sticky=true;
+ const nearTail=()=>conversation.scrollHeight-conversation.scrollTop-conversation.clientHeight<=tailThreshold;
+ const syncButton=()=>{if(latest)latest.hidden=sticky};
  const followLatest=()=>{
-  if(scrollPending)return;scrollPending=true;
-  requestAnimationFrame(()=>{scrollPending=false;conversation.scrollTop=conversation.scrollHeight;});
+  if(!sticky||scrollPending)return;scrollPending=true;
+  requestAnimationFrame(()=>{scrollPending=false;if(!sticky)return;conversation.scrollTop=conversation.scrollHeight;syncButton()});
  };
+ conversation.addEventListener('scroll',()=>{sticky=nearTail();syncButton()},{passive:true});
+ latest?.addEventListener('click',()=>{sticky=true;followLatest()});
  new MutationObserver(followLatest).observe(conversation,{childList:true,subtree:true,characterData:true});
  // Images/code wrapping can change layout after their message is inserted.
  conversation.addEventListener('load',followLatest,true);

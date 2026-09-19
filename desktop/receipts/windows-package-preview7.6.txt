@@ -1,0 +1,27 @@
+Windows x64 internal installer — 2026-09-19
+
+Artifact: desktop/artifacts/Codewhale-MedSci_0.1.0-preview.7.6_windows-x64_internal-setup.exe
+Installer revision: preview.7.6; application version remains preview.7.
+Includes the current GUI file/folder paste and drag references and workspace picker.
+Reuses the existing local Agent, Python, offline wheels and Git Bash payload.
+The release GUI SHA-256 and every source input in its existing development
+build-provenance.json matched before packaging. No GUI rebuild was necessary.
+Previous preview.7.5 installer and its staging directory were preserved.
+
+Commands run:
+python desktop/scripts/package-windows.py --version 0.1.0-preview.7.6 --desktop-exe C:/Codewhale-MedSci/apps/desktop/target/release/medsci-desktop.exe
+python desktop/scripts/verify-windows-package.py --version 0.1.0-preview.7.6
+python desktop/scripts/protocol-smoke.py C:/Codewhale-MedSci/desktop/artifacts/stage-windows-x86_64-0.1.0-preview.7.6/resources/codewhale.exe
+git diff --check -- desktop/scripts/package-windows.py desktop/scripts/verify-windows-package.py
+
+PASS: NSIS integrity, SHA-256, 12452 extracted payload files match staging,
+x64 PE binaries, VC runtime DLLs, source provenance, and all offline wheel hashes.
+PASS: sidecar version, desktop capabilities, thread/start, shutdown;
+no credentials or provider calls.
+
+Packaging script now accepts version and desktop executable parameters, uses
+explicit UTF-8 for NSIS and native wildcard paths when compiling on Windows.
+
+Unsigned internal build. Native installation/uninstallation, WebView2 and GUI
+interaction were not exercised. No push, CI run or public release performed.
+Apple Silicon and Intel Mac builds deferred at the user's request.

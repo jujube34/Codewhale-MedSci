@@ -1,9 +1,13 @@
 """Check the assembled NSIS payload without claiming native Windows GUI testing."""
-import hashlib,json,pathlib,struct,subprocess,tempfile
+import argparse,hashlib,json,pathlib,struct,subprocess,tempfile
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--version',default='0.1.0-preview.7.5')
+parser.add_argument('--stage',type=pathlib.Path)
+args=parser.parse_args()
 root=pathlib.Path(__file__).resolve().parents[2]
 artifacts=root/'desktop/artifacts'
-installer=artifacts/'Codewhale-MedSci_0.1.0-preview.7.5_windows-x64_internal-setup.exe'
-stage=artifacts/'stage-windows-x86_64'
+installer=artifacts/f'Codewhale-MedSci_{args.version}_windows-x64_internal-setup.exe'
+stage=args.stage or artifacts/f'stage-windows-x86_64-{args.version}'
 def digest(path):return hashlib.sha256(path.read_bytes()).hexdigest()
 assert digest(installer)==installer.with_suffix('.exe.sha256').read_text().split()[0]
 result=subprocess.run(['7z','t',str(installer)],capture_output=True,text=True,check=True)
@@ -42,4 +46,4 @@ with tempfile.TemporaryDirectory(prefix='windows-payload-',dir=artifacts) as tem
         assert digest(resources/'python/vc-runtime'/dll)==sha
         assert digest(payload/dll)==digest(resources/'python/cpython'/dll)==digest(resources/dll)==sha
     print(f'PASS: NSIS integrity, SHA-256, {count} extracted payload files match staging, x64 PE binaries, VC runtime DLLs, source provenance, and all offline wheel hashes')
-print('Native Windows install/uninstall, WebView2 and GUI behavior remain unverified on this macOS host.')
+print('This check does not exercise native installation/uninstallation, WebView2 or GUI behavior.')

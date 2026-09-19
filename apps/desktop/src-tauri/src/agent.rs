@@ -20,6 +20,111 @@ pub struct Agent {
     stdin: Mutex<ChildStdin>,
     pending: Arc<Mutex<HashMap<u64, Reply>>>,
     next: AtomicU64,
+    python_lease: Mutex<Option<std::fs::File>>,
+    #[cfg(windows)]
+    job: Mutex<Option<std::os::windows::io::OwnedHandle>>,
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::*;
+
+    #[tokio::test]
+    async fn multi_instance_job_reaps_only_its_own_descendants() {
+        let mut first = Command::new("cmd.exe")
+            .args(["/D", "/Q"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let first_job = own_process_tree(&first).unwrap();
+        let mut second = Command::new("cmd.exe")
+            .args(["/D", "/Q"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let second_job = own_process_tree(&second).unwrap();
+        first
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"ping -n 60 127.0.0.1 >NUL\r\nexit\r\n")
+            .await
+            .unwrap();
+        let mut descendants = false;
+        for _ in 0..100 {
+            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                QueryInformationJobObject(
+                    first_job.as_raw_handle(),
+                    JobObjectBasicAccountingInformation,
+                    (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                    std::mem::size_of_val(&info) as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(result, 0);
+            if info.ActiveProcesses >= 2 {
+                descendants = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(descendants, "the shell's child must join its owner's job");
+        drop(first_job);
+        tokio::time::timeout(std::time::Duration::from_secs(5), first.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(second.try_wait().unwrap().is_none());
+        drop(second_job);
+        tokio::time::timeout(std::time::Duration::from_secs(5), second.wait())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+#[cfg(windows)]
+fn own_process_tree(child: &Child) -> Result<std::os::windows::io::OwnedHandle, String> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::JobObjects::*;
+    // The unnamed job contains only this sidecar and its descendants. Closing
+    // the desktop (including a crash) kills the tree without touching peers.
+    unsafe {
+        let raw = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if raw.is_null() {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let job = OwnedHandle::from_raw_handle(raw);
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of_val(&limits) as u32,
+        ) == 0
+            || AssignProcessToJobObject(
+                job.as_raw_handle(),
+                child.raw_handle().ok_or("Agent 已退出")?,
+            ) == 0
+        {
+            return Err(format!(
+                "无法隔离 Agent 子进程：{}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(job)
+    }
 }
 impl Agent {
     pub async fn start(
@@ -28,7 +133,10 @@ impl Agent {
         home: &Path,
         config: &Path,
         key: &str,
+        key_env: &str,
         python_bin: Option<&Path>,
+        python_lease: Option<std::fs::File>,
+        runtime_dir: &Path,
     ) -> Result<(Arc<Self>, mpsc::Receiver<(Value, oneshot::Sender<()>)>), String> {
         let mut cmd = Command::new(binary);
         cmd.args([
@@ -40,8 +148,9 @@ impl Agent {
         .current_dir(cwd)
         .env_clear()
         .env("CODEWHALE_HOME", home)
+        .env("CODEWHALE_RUNTIME_DIR", runtime_dir)
         .env("CODEWHALE_DESKTOP_SUPERVISED", "1")
-        .env("DEEPSEEK_API_KEY", key)
+        .env(key_env, key)
         .env("CODEWHALE_TELEMETRY", "0")
         .env("PYTHONNOUSERSITE", "1")
         .env("PYTHONDONTWRITEBYTECODE", "1")
@@ -151,6 +260,8 @@ impl Agent {
         let mut child = cmd
             .spawn()
             .map_err(|_| "Agent 启动失败，请检查安装包完整性".to_string())?;
+        #[cfg(windows)]
+        let job = own_process_tree(&child)?;
         let stdin = child.stdin.take().ok_or("Agent stdin unavailable")?;
         let stdout = child.stdout.take().ok_or("Agent stdout unavailable")?;
         let pending: Arc<Mutex<HashMap<u64, Reply>>> = Arc::default();
@@ -197,6 +308,9 @@ impl Agent {
                 stdin: Mutex::new(stdin),
                 pending,
                 next: AtomicU64::new(1),
+                python_lease: Mutex::new(python_lease),
+                #[cfg(windows)]
+                job: Mutex::new(Some(job)),
             }),
             rx,
         ))
@@ -254,5 +368,8 @@ impl Agent {
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
+        #[cfg(windows)]
+        self.job.lock().await.take();
+        self.python_lease.lock().await.take();
     }
 }

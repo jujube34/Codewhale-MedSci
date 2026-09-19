@@ -23,7 +23,7 @@ class FinderSync: FIFinderSync {
         let application = Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let config = NSWorkspace.OpenConfiguration()
         config.arguments = [url.path]
-        config.createsNewApplicationInstance = true // Host forwards through its single-instance guard.
+        config.createsNewApplicationInstance = true // Each invocation owns an independent workspace/session.
         NSWorkspace.shared.openApplication(at: application, configuration: config) { _, _ in }
     }
 }

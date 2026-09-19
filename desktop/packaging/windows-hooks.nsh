@@ -1,9 +1,11 @@
 !include "LogicLib.nsh"
-!define MEDSCI_GIT_INIT_SCRIPT "${__FILEDIR__}/windows-git-init.cmd"
+!define MEDSCI_GIT_INIT_SCRIPT "${__FILEDIR__}\windows-git-init.cmd"
 !macro NSIS_HOOK_POSTINSTALL
  ; Use an absolute command, scoped environment, and verified completion.
  InitPluginsDir
- File /oname=$PLUGINSDIR\medsci-git-init.cmd "${MEDSCI_GIT_INIT_SCRIPT}"
+ SetOutPath "$PLUGINSDIR"
+ File /oname=medsci-git-init.cmd "${MEDSCI_GIT_INIT_SCRIPT}"
+ SetOutPath "$INSTDIR"
  DetailPrint "正在初始化内置 Git Bash..."
  nsExec::ExecToLog /TIMEOUT=60000 '$\"$SYSDIR\cmd.exe$\" /D /S /C $\"$\"$PLUGINSDIR\medsci-git-init.cmd$\" $\"$INSTDIR\resources\git-bash$\"$\"'
  Pop $0
